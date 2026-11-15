@@ -1,0 +1,59 @@
+[gd_scene format=3 uid="uid://44rejs120lp"]
+
+[ext_resource type="Script" uid="uid://g46215tc86vd" path="res://maingame.gd" id="1_u3icf"]
+[ext_resource type="Script" uid="uid://dox5j36n5ofhl" path="res://addons/zylann.hterrain/hterrain.gd" id="1_xu13d"]
+[ext_resource type="Resource" uid="uid://bylubnh7oih8v" path="res://terrain/data.hterrain" id="2_u3icf"]
+[ext_resource type="Script" uid="uid://boqbq2orjwqx7" path="res://addons/zylann.hterrain/hterrain_texture_set.gd" id="3_cuu4a"]
+
+[sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_qfmxy"]
+sky_top_color = Color(0, 0, 0, 1)
+sky_horizon_color = Color(0.5549999, 0.4157908, 0.37869617, 1)
+ground_bottom_color = Color(0.8578513, 0.3010149, 0.15263635, 1)
+ground_horizon_color = Color(0.5549999, 0.4157908, 0.37869617, 1)
+energy_multiplier = 0.85
+
+[sub_resource type="Sky" id="Sky_l262f"]
+sky_material = SubResource("ProceduralSkyMaterial_qfmxy")
+
+[sub_resource type="Environment" id="Environment_fputw"]
+background_mode = 2
+sky = SubResource("Sky_l262f")
+
+[sub_resource type="Resource" id="Resource_ekqhg"]
+script = ExtResource("3_cuu4a")
+mode = 0
+textures = [[], []]
+
+[node name="Main" type="Node3D" unique_id=1137281516]
+script = ExtResource("1_u3icf")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=1333898108]
+environment = SubResource("Environment_fputw")
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=1922244170]
+transform = Transform3D(-0.8660254, -0.43301278, 0.25, 0, 0.49999997, 0.86602545, -0.50000006, 0.75, -0.43301266, 0, 0, 0)
+light_color = Color(1, 0.63832563, 0.48019093, 1)
+shadow_enabled = true
+
+[node name="HTerrain" type="Node3D" parent="." unique_id=973897399]
+transform = Transform3D(0.3, 0, 0, 0, 0.3, 0, 0, 0, 0.3, 0, 0, 0)
+script = ExtResource("1_xu13d")
+centered = true
+_terrain_data = ExtResource("2_u3icf")
+chunk_size = 32
+collision_enabled = true
+collision_layer = 1
+collision_mask = 1
+physics_material = null
+shader_type = "Classic4Lite"
+custom_shader = null
+custom_globalmap_shader = null
+texture_set = SubResource("Resource_ekqhg")
+render_layers = 1
+cast_shadow = 1
+shader_params/u_ground_uv_scale = 20
+shader_params/u_depth_blending = true
+shader_params/u_triplanar = false
+shader_params/u_tile_reduction = Vector4(0, 0, 0, 0)
+shader_params/u_specular = 0.5
+metadata/_custom_type_script = "uid://dox5j36n5ofhl"
