@@ -1,2 +1,3 @@
-# MarsSim-FINAL-PROJECT
-Mars Simulator Master Edition Godot 4.x 3D sim.  Features      Orbital &amp; surface view      Hardware scaling      Survival &amp; rover      Single GDScript  Controls      Menu: Drag, zoom, Launch      Surface: WASD, R rover, E eat, Z sleep, Esc menu  Setup Attach script to Node3D &amp; press F5.
+This is a game that has the mission of teaching curious teens all about space (specifically Mars). Our goal is to change the mindsets of teenagers about space and make it look simple and fun in their eyes. Through this game we are saving future employees from the curse of ''never trying'' and improving future employees' quality in NASA.
+ The game consists of an astronaut (you) who has to complete tasks/missions from the NASA center and manages and develops a martian outpost while exploring Gale Crater (2012 Curiosity Rover landing site).
+  It addresses the Challenge by creating a fun and easy way to learn about Mars and space, without making it seem too much like school/homework.
