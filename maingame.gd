@@ -1,4344 +1,3627 @@
-extends Node3D
-## ═══════════════════════════════════════════════════════════════════════════
-##  MARS SIMULATOR — MASTER EDITION II   (Godot 4.2+ / GDScript, single script)
-## ═══════════════════════════════════════════════════════════════════════════
-##  SETUP: one root Node3D, attach this script, run. Everything is built in code.
+## =====================================================================
+##  MARS SIMULATOR — single-file Godot 4 (4.3+) version
+## =====================================================================
+##  How to run:
+##   1. Create a new Godot 4 project.
+##   2. Make a new scene whose root is a plain "Node", attach this script,
+##      save the scene and set it as the main scene (Project > Project Settings
+##      > Application > Run > Main Scene).
+##   3. Press F5.
+##  Everything (planet, base, astronaut, rover, menus) is generated in code.
+##  Progress is saved to user://mars_save.json.
 ##
-##  MENU    : drag = orbit Mars | wheel = zoom | age slider | Launch
-##  INTRO   : capsule drop from orbit  •  Space / Enter = skip
-##  SURFACE : WASD / arrows = move or drive | Shift = sprint | drag = camera
-##            F = interact (HOLD F on glowing deposits to mine)
-##            I / Tab = inventory | E = eat best food | Q = use Power Cell
-##            R = board / exit rover | H = back to landing pad
-##            Backspace = skip training | F9 = trigger hazard | Esc = pause
-## ═══════════════════════════════════════════════════════════════════════════
+##  Controls: WASD/arrows move · Space jump · Shift sprint · E interact ·
+##  M Mission Control · drag to look · wheel/pinch to zoom.
+##  On touch screens an on-screen joystick and buttons appear.
+## =====================================================================
+extends Node
 
-enum SimState { MENU_ORBIT, SURFACE }
-enum Hazard { NONE, DUST_STORM, SOLAR_FLARE }
-enum Intro { NONE, ENTRY, CHUTE, RETRO, LANDED, EGRESS }
+# ---------------------------------------------------------------- main
+const SAVE_PATH := "user://mars_save.json"
 
-# ─────────────────────────────── TUNABLES ───────────────────────────────────
-const EVENT_TEXT := "LIVE EVENT  •  SUN 15 NOV 2026"
-const GALE_LAT_DEG := -5.4
-const GALE_LON_DEG := 137.8
-const GLOBE_RADIUS := 5.0
-const WORLD_LIMIT := 260.0
-const PLAYER_Y := 0.5
-const WALK_SPEED := 4.5
-const SPRINT_SPEED := 9.0
-const ROVER_MAX_SPEED := 16.0
-const ROVER_ACCEL := 9.0
-const ROVER_TURN := 1.5
-const HAB_POS := Vector3(0.0, 0.0, -20.0)
-const PAD_POS := Vector3(0.0, 0.0, 14.0)
-const SPAWN_POS := Vector3(0.0, 0.5, 10.6)
-const ROVER_START := Vector3(14.0, 0.5, 10.0)
-const BASE_MIN := Vector2(-25.0, -27.0)
-const BASE_MAX := Vector2(25.0, 9.0)
-const WALL_H := 3.2
-const SLEEP_TIME := 4.0
-const FOOD_DRAIN := 0.45
-const REST_DRAIN := 0.35
-const POWER_DRAIN := 0.15
-const ROVER_POWER := 0.9
-const INV_SLOTS := 20
-const STACK_MAX := 99
-const MAX_DEPOSITS := 28
-const COMBO_WINDOW := 10.0
-const CAPSULE_START_Y := 320.0
-const SAVE_PATH := "user://mars_sim_save.cfg"
-const DEMO_STREAK := 0          # >0 forces a streak value for demos
-const FOG_BASE := 0.0014
-const FOG_STORM := 0.016
-const COL_FOG_CLEAR := Color(0.80, 0.56, 0.42)
-const COL_FOG_STORM := Color(0.72, 0.44, 0.27)
+var save := {}
+var mode := "orbit"
+var orbit
+var base
+var ui
 
-const ATMO_SHADER := """
-shader_type spatial;
-render_mode unshaded, blend_add, cull_back, depth_draw_never;
-uniform vec4 glow_color : source_color = vec4(1.0, 0.5, 0.3, 1.0);
-void fragment() {
-	float f = pow(1.0 - clamp(dot(normalize(NORMAL), normalize(VIEW)), 0.0, 1.0), 3.0);
-	ALBEDO = glow_color.rgb;
-	ALPHA = clamp(f * 0.95, 0.0, 1.0);
-}
-"""
-
-# ─────────────────────────────── DATA TABLES ────────────────────────────────
-const ITEMS := {
-	"ration":     {"name": "Ration Pack",    "cat": "food",     "col": Color(0.95, 0.62, 0.22), "food": 30.0, "rest": 0.0,  "desc": "Freeze-dried meal. +30 Food."},
-	"greens":     {"name": "Fresh Greens",   "cat": "food",     "col": Color(0.40, 0.85, 0.35), "food": 18.0, "rest": 6.0,  "desc": "Greenhouse crop. +18 Food, +6 Rest."},
-	"energy_bar": {"name": "Energy Bar",     "cat": "food",     "col": Color(0.85, 0.45, 0.65), "food": 12.0, "rest": 14.0, "desc": "Fabricated snack. +12 Food, +14 Rest."},
-	"power_cell": {"name": "Power Cell",     "cat": "tool",     "col": Color(1.00, 0.85, 0.25), "power": 35.0, "desc": "Portable battery. +35 Power (Q)."},
-	"iron":       {"name": "Iron Ore",       "cat": "material", "col": Color(0.85, 0.38, 0.22), "desc": "Iron oxide — why Mars is red."},
-	"silica":     {"name": "Silica Crystal", "cat": "material", "col": Color(0.92, 0.88, 0.98), "desc": "For solar cells and glass."},
-	"ice":        {"name": "Water Ice",      "cat": "material", "col": Color(0.55, 0.85, 1.00), "desc": "Buried ice: water and oxygen."},
-	"titanium":   {"name": "Titanium",       "cat": "material", "col": Color(0.72, 0.55, 1.00), "desc": "Rare metal for upgrades."},
-	"gem":        {"name": "Isotope Gem",    "cat": "material", "col": Color(0.30, 1.00, 0.50), "desc": "Expedition objective."},
-}
-const RECIPES := [
-	{"id": "power_cell", "name": "Power Cell",     "cost": {"iron": 2, "silica": 1},   "out": {"power_cell": 1}},
-	{"id": "energy_bar", "name": "Energy Bar x2",  "cost": {"greens": 1, "ice": 1},    "out": {"energy_bar": 2}},
-	{"id": "ration",     "name": "Ration Pack x2", "cost": {"ice": 1, "greens": 2},    "out": {"ration": 2}},
-	{"id": "drill",      "name": "Drill Upgrade",  "cost": {"iron": 4, "titanium": 1}, "out": {}},
-]
-const PALETTE := [
-	{"name": "Polar White", "col": Color(0.93, 0.93, 0.95), "lvl": 1,  "streak": 0},
-	{"name": "Mars Orange", "col": Color(0.95, 0.45, 0.15), "lvl": 2,  "streak": 0},
-	{"name": "Cobalt",      "col": Color(0.20, 0.40, 0.90), "lvl": 3,  "streak": 0},
-	{"name": "Moss",        "col": Color(0.30, 0.60, 0.30), "lvl": 4,  "streak": 0},
-	{"name": "Crimson",     "col": Color(0.80, 0.12, 0.15), "lvl": 6,  "streak": 0},
-	{"name": "Midnight",    "col": Color(0.14, 0.14, 0.22), "lvl": 8,  "streak": 0},
-	{"name": "Streak Gold", "col": Color(1.00, 0.78, 0.25), "lvl": 1,  "streak": 7},
-	{"name": "Aurora",      "col": Color(0.85, 0.40, 0.95), "lvl": 12, "streak": 0},
-]
-const VISORS := [
-	{"name": "Gold",    "col": Color(1.0, 0.78, 0.25),  "lvl": 1, "streak": 0},
-	{"name": "Silver",  "col": Color(0.80, 0.85, 0.90), "lvl": 2, "streak": 0},
-	{"name": "Cyan",    "col": Color(0.20, 0.90, 1.00), "lvl": 4, "streak": 0},
-	{"name": "Emerald", "col": Color(0.20, 1.00, 0.50), "lvl": 1, "streak": 3},
-	{"name": "Rose",    "col": Color(1.00, 0.40, 0.60), "lvl": 7, "streak": 0},
-]
-const RARITY_NAMES := ["Common", "Rare", "Epic", "Legendary"]
-const RARITY_COLORS := [Color(0.85, 0.85, 0.85), Color(0.3, 0.6, 1.0), Color(0.8, 0.35, 1.0), Color(1.0, 0.75, 0.15)]
-const ACHIEVEMENTS := {
-	"tutorial":  ["First Steps", "Finish the training"],
-	"miner25":   ["Rock Breaker", "Mine 25 times"],
-	"miner100":  ["Geologist", "Mine 100 times"],
-	"gems10":    ["Gem Hunter", "Collect 10 Isotope Gems"],
-	"drive1k":   ["Road Trip", "Drive 1 km in the rover"],
-	"harvest10": ["Green Thumb", "Harvest 10 plants"],
-	"legendary": ["Jackpot", "Open a legendary supply drop"],
-	"combo":     ["Unstoppable", "Reach a x3.0 combo"],
-	"streak3":   ["Habit Forming", "3-day streak"],
-	"streak7":   ["Dedicated", "7-day streak"],
-	"exped3":    ["Veteran", "Complete 3 expeditions"],
-	"crafter":   ["Maker", "Craft 10 items"],
-}
-const DAILY_POOL := [
-	{"type": "mine",    "goal": 12,  "text": "Mine %d deposits"},
-	{"type": "gems",    "goal": 4,   "text": "Collect %d Isotope Gems"},
-	{"type": "drive",   "goal": 600, "text": "Drive %d m in the rover"},
-	{"type": "harvest", "goal": 4,   "text": "Harvest %d plants"},
-	{"type": "drops",   "goal": 2,   "text": "Open %d supply drops"},
-	{"type": "craft",   "goal": 3,   "text": "Craft %d items"},
-]
-# ── age decision branch ──
-const BRACKETS := [
-	{"name": "Junior Explorer",    "max": 10, "drain": 0.55, "hazard": 0.5,  "flare": false, "gems": 5,  "hints": true,  "break_min": 20, "xp": 1.25, "goal_mult": 0.5,
-		"desc": "Friendly step-by-step training, guide arrows, gentle storms (no solar flares), simple Mars facts and stretch-break reminders."},
-	{"name": "Space Cadet",        "max": 13, "drain": 0.75, "hazard": 0.75, "flare": true,  "gems": 6,  "hints": true,  "break_min": 30, "xp": 1.1,  "goal_mult": 0.75,
-		"desc": "Guided training, guide arrows, mild storms and flares, Mars facts, break reminder every 30 min."},
-	{"name": "Mission Specialist", "max": 17, "drain": 1.0,  "hazard": 1.0,  "flare": true,  "gems": 8,  "hints": false, "break_min": 45, "xp": 1.0,  "goal_mult": 1.0,
-		"desc": "Full training, standard survival drain, all hazards, more gems to find."},
-	{"name": "Commander",          "max": 999, "drain": 1.3, "hazard": 1.35, "flare": true,  "gems": 10, "hints": false, "break_min": 0,  "xp": 1.0,  "goal_mult": 1.3,
-		"desc": "Condensed technical briefing, heavy drain, frequent hazards, 10 gems, no guide arrows."},
-]
-const FACTS := [
-	["Mars looks red because its dust is full of rusty iron!", "Mars' red colour comes from iron oxide (rust) in the surface dust."],
-	["You'd weigh much less on Mars — you could jump almost 3 times higher!", "Surface gravity on Mars is about 38% of Earth's."],
-	["A day on Mars is only about 40 minutes longer than on Earth.", "A Martian solar day (sol) lasts about 24 h 40 min."],
-	["Mars has the biggest volcano we know of: Olympus Mons!", "Olympus Mons rises about 22 km — roughly 2.5 times Everest."],
-	["Mars has two little moons called Phobos and Deimos.", "Phobos and Deimos are small, lumpy moons, possibly captured asteroids."],
-	["The air on Mars is super thin, so astronauts need space suits.", "The atmosphere is ~95% carbon dioxide, at under 1% of Earth's pressure."],
-	["The Curiosity rover landed in Gale Crater in 2012!", "NASA's Curiosity landed in Gale Crater in August 2012 and has explored Mount Sharp since."],
-	["Some Mars dust storms can cover the whole planet!", "Global dust storms can last weeks; one in 2018 ended the Opportunity rover's mission."],
-	["Mars is usually colder than the North Pole!", "Average surface temperature is around −60 °C."],
-	["Messages to Earth take minutes, so astronauts solve problems themselves.", "Radio signals take roughly 3–22 minutes between Mars and Earth."],
-]
-# texts per bracket: [Explorer, Cadet, Specialist, Commander]; "skip" lists brackets that skip the step
-const TUTORIAL := [
-	{"id": "look", "title": "Look around", "skip": [3], "t": [
-		"Hold a mouse button and drag to spin the camera. Wow — you're on Mars!",
-		"Click and drag to rotate the camera. Scroll the wheel to zoom.",
-		"Drag to orbit the camera and scroll to zoom. Take in the crater.", ""]},
-	{"id": "move", "title": "Walk", "skip": [], "t": [
-		"Press W A S D (or the arrow keys) to walk. Walk a little way!",
-		"Use W A S D or the arrow keys to walk. Movement follows the camera.",
-		"WASD / arrows move relative to the camera. Walk 10 metres.",
-		"WASD to move (camera-relative). Walk 10 m to calibrate the suit."]},
-	{"id": "sprint", "title": "Sprint", "skip": [3], "t": [
-		"Hold SHIFT while walking to run super fast!",
-		"Hold Shift while moving to sprint. Sprinting uses more food and rest.",
-		"Hold Shift to sprint — it drains Food and Rest faster.", ""]},
-	{"id": "crate", "title": "Interact", "skip": [], "t": [
-		"See the glowing box? Walk to it and press F to open it!",
-		"Walk to the glowing supply crate on the landing pad and press F to open it.",
-		"Approach the supply crate (marked ▼) and press F to interact.",
-		"Recover the supply crate at the marker. F = interact."]},
-	{"id": "inventory", "title": "Inventory", "skip": [], "t": [
-		"Press I to open your backpack and see what you found!",
-		"Press I or Tab to open your inventory. Food and materials live here.",
-		"Open your inventory (I / Tab): 20 slots, stacks of up to 99.",
-		"Inventory: I / Tab. 20 slots, stacks of 99."]},
-	{"id": "eat", "title": "Eat", "skip": [], "t": [
-		"Yum! Click the Ration Pack in your backpack, or press E, to eat.",
-		"Eat something: click a food item in the inventory, or press E.",
-		"Eat from the inventory (click a food) or press E to eat the best food you carry.",
-		"Consume a ration (E). Food drains constantly; starving halves your speed."]},
-	{"id": "mine", "title": "Mine", "skip": [], "t": [
-		"Find the sparkly rock nearby. Stand next to it and HOLD F to mine it!",
-		"Find a glowing mineral deposit and HOLD F next to it to mine.",
-		"Deposits glow by mineral type. HOLD F beside one to mine — each gives several yields.",
-		"Hold F at a deposit to extract ore. Chain actions within 10 s to build a combo."]},
-	{"id": "base", "title": "Enter the base", "skip": [], "t": [
-		"Follow the arrow to your Mars base and walk in through the big door!",
-		"Follow the marker to Base Alpha and enter through the airlock.",
-		"Enter Base Alpha via the south airlock. Inside, power recharges and you're safe from flares.",
-		"Enter Base Alpha. Habitat = power recharge + radiation shelter."]},
-	{"id": "craft", "title": "Craft", "skip": [], "t": [
-		"Go to the Workshop. Use the big orange machine (F) to make a Power Cell!",
-		"Go to the Workshop and use the Fabricator (F). Craft a Power Cell from iron and silica.",
-		"Workshop → Fabricator (F). Turn 2 Iron + 1 Silica into a Power Cell.",
-		"Fabricate a Power Cell (2 iron, 1 silica) in the Workshop."]},
-	{"id": "locker", "title": "Customise", "skip": [], "t": [
-		"Go to the bedroom and open your locker (F) to pick your space-suit colour!",
-		"Visit Crew Quarters and open your locker (F) to customise your suit and rover.",
-		"Crew Quarters → your locker (F): suit, visor, accents, rover paint and callsign.",
-		"Cosmetics at your locker (Crew Quarters). Levels and streaks unlock more."]},
-	{"id": "sleep", "title": "Sleep", "skip": [], "t": [
-		"Feeling sleepy? Lie down in a bunk bed (F) for a nap.",
-		"Rest in one of the bunks (F) to refill your Rest bar.",
-		"Sleep in a bunk (F) to restore Rest. Sleeping costs a little Food.",
-		"Sleep cycle at a bunk (F). Rest at 0 halves your speed."]},
-	{"id": "rover", "title": "Drive", "skip": [], "t": [
-		"Go outside to the big rover. Press R to hop in and drive around!",
-		"Head outside to the ARES rover, press R to board, then drive 40 m.",
-		"Board the ARES rover (R) and drive 40 m. Driving drains power faster.",
-		"Rover: R to board/exit. Drive 40 m. Watch power draw at speed."]},
-	{"id": "gem", "title": "Find a gem", "skip": [], "t": [
-		"Look for the tall green lights and drive into a gem to grab it!",
-		"Follow a green beam and collect an Isotope Gem — your main objective.",
-		"Collect an Isotope Gem (green beams). Gems finish the expedition and restore power.",
-		"Recover one Isotope Gem. The full set ends the expedition."]},
-	{"id": "done", "title": "Training complete", "skip": [], "t": [
-		"You did it, Space Explorer! Watch for supply drops and come back tomorrow for your streak bonus!",
-		"Training complete! Supply drops fall from the sky — open them for loot. Daily streaks give bonus supplies.",
-		"Training complete. Open supply drops, complete daily missions and keep your streak alive for rewards.",
-		"Briefing complete. Daily missions, drops and streak bonuses are live. Good hunting, Commander."]},
-]
-
-# ─────────────────────────────── STATE ──────────────────────────────────────
-var state: int = SimState.MENU_ORBIT
-var rng := RandomNumberGenerator.new()
-var transitioning := false
-var dragging := false
-var time_accum := 0.0
-var ui_modal := ""
-var autosave_timer := 30.0
-
-# hardware profile
-var q_tier := "HIGH"
-var q_os := ""
-var q_cores := 4
-var q_shadows := true
-var q_globe_seg := 128
-var q_globe_rings := 64
-var q_tex_w := 768
-var q_tex_h := 384
-var q_ground := 256
-var q_rocks := 450
-var q_pebbles := 800
-var q_stars := 500
-var q_glow := true
-var q_particles := true
-var q_ssao := true
-var q_volumetric := false
-var q_lights := true
-var q_msaa: int = Viewport.MSAA_4X
-
-# scene
-var menu_root: Node3D
-var surface_root: Node3D
-var menu_pivot: Node3D
-var menu_camera: Camera3D
-var surface_camera: Camera3D
-var globe_spin: Node3D
-var beacon_pin: Node3D
-var beacon_halo: MeshInstance3D
-var beacon_ring: MeshInstance3D
-var beacon_ring_mat: StandardMaterial3D
-var surface_env: Environment
-var surface_sun: DirectionalLight3D
-var mars_tex: ImageTexture
-var dust_particles: CPUParticles3D
-var motes: CPUParticles3D
-var burst_fx: CPUParticles3D
-var rover_dust: CPUParticles3D
-var step_dust: CPUParticles3D
-var hab_root: Node3D
-var roof_root: Node3D
-var hab_beacon_mat: StandardMaterial3D
-var pad_light_mat: StandardMaterial3D
-var holo_globe: Node3D
-var drone: Node3D
-var o2_fans: Array[Node3D] = []
-var hm_hull: StandardMaterial3D
-var hm_trim: StandardMaterial3D
-var hm_glow: StandardMaterial3D
-var hm_amber: StandardMaterial3D
-var hm_dark: StandardMaterial3D
-var hm_screen: StandardMaterial3D
-var hm_wood: StandardMaterial3D
-var circles: Array[Vector3] = []     # x, z, radius
-var rects: Array[Rect2] = []         # world XZ boxes
-var rooms: Array[Dictionary] = []
-var base_rect := Rect2()
-var objective_marker: Node3D
-var objective_label: Label3D
-var objective_pos := Vector3.ZERO
-var has_objective := false
-
-# capsule / intro
-var capsule: Node3D
-var capsule_glow: MeshInstance3D
-var capsule_trail: CPUParticles3D
-var capsule_flame: CPUParticles3D
-var capsule_light: OmniLight3D
-var hatch_hinge: Node3D
-var chute: Node3D
-var chute_attached := true
-var chute_drift := Vector3.ZERO
-var chute_age := 0.0
-var landing_dust: CPUParticles3D
-var intro_phase: int = Intro.NONE
-var intro_timer := 0.0
-var cap_y := 0.0
-var cap_vel := 0.0
-var intro_orbit := 0.0
-var intro_dist := 26.0
-var shake := 0.0
-
-# player / vehicles
-var astro: Node3D
-var astro_model: Node3D
-var arm_l: Node3D
-var arm_r: Node3D
-var leg_l: Node3D
-var leg_r: Node3D
-var callsign_label: Label3D
-var helmet_light: SpotLight3D
-var suit_mat: StandardMaterial3D
-var visor_mat: StandardMaterial3D
-var accent_mat: StandardMaterial3D
-var rover_paint_mat: StandardMaterial3D
-var player_pos := SPAWN_POS
-var player_heading := 0.0
-var walk_phase := 0.0
-var is_moving := false
-var sprinting := false
-var rover: Node3D
-var rover_wheels: Array[Node3D] = []
-var rover_speed := 0.0
-var rover_heading := 0.5
-var driving := false
-var inside_base := false
-
-# cameras
-var cam_yaw := 0.0
-var cam_pitch := 0.38
-var cam_dist := 8.0
-var cam_eff_dist := 8.0
-var cam_eff_pitch := 0.38
-var cam_target := Vector3.ZERO
-var menu_yaw := 0.0
-var menu_pitch := 0.12
-var menu_dist := 13.0
-var menu_dist_target := 13.0
-
-# mission
-var cadet_age := 16
-var bracket := 2
-var difficulty := 1.0
-var ease := 1.0
-var exhaust_events := 0
-var was_exhausted := false
-var power := 100.0
-var food := 100.0
-var rest := 100.0
-var gems := 0
-var gem_target := 8
-var expedition := 1
-var mission_time := 0.0
-var mission_complete := false
-var hazard: int = Hazard.NONE
-var hazard_timer := 70.0
-var sleeping := false
-var sleep_timer := 0.0
-var sleep_rest_from := 0.0
-var power_warned := false
-var collectibles: Array[Dictionary] = []
-var interactables: Array[Dictionary] = []
-var inventory := {}
-var focus: Dictionary = {}
-var mine_target: Dictionary = {}
-var mine_progress := 0.0
-var combo := 0
-var combo_timer := 0.0
-var drop_timer := 75.0
-var deposit_timer := 25.0
-var fact_timer := 35.0
-var fact_index := 0
-var fact_time := 0.0
-var play_time := 0.0
-var break_at := 0.0
-
-# persistent progression
-var level := 1
-var xp := 0
-var drill_level := 1
-var total_gems := 0
-var total_mined := 0
-var total_harvest := 0
-var total_crafted := 0
-var total_drive := 0.0
-var expeditions_done := 0
-var streak := 1
-var best_streak := 1
-var streak_last_day := 0
-var claimed_day := 0
-var achievements: Array = []
-var tutorial_done := false
-var play_tutorial := true
-var suit_idx := 0
-var visor_idx := 0
-var accent_idx := 1
-var rover_idx := 1
-var callsign := "CADET"
-var daily_day := 0
-var daily: Array = []
-
-# tutorial
-var tut_active := false
-var tut_steps: Array = []
-var tut_index := 0
-var tut_cam_drag := 0.0
-var tut_walk := 0.0
-var tut_sprint := 0.0
-var tut_drive := 0.0
-var tut_flags := {}
-var tut_done_timer := 0.0
-var tut_crate_pos := Vector3.ZERO
-
-# UI
-var menu_layer: CanvasLayer
-var hud_layer: CanvasLayer
-var intro_layer: CanvasLayer
-var modal_layer: CanvasLayer
-var fade_layer: CanvasLayer
-var fade_rect: ColorRect
-var hud_root: Control
-var menu_panel: PanelContainer
-var launch_btn: Button
-var age_slider: HSlider
-var age_label: Label
-var diff_label: Label
-var branch_label: Label
-var profile_label: Label
-var streak_badge: Label
-var tut_check: CheckBox
-var pin_label: Label
-var power_bar: ProgressBar
-var food_bar: ProgressBar
-var rest_bar: ProgressBar
-var cadet_label: Label
-var hazard_label: Label
-var mode_label: Label
-var room_label: Label
-var mission_label: Label
-var daily_label: Label
-var toast_label: Label
-var level_label: Label
-var rank_label: Label
-var streak_label: Label
-var xp_bar: ProgressBar
-var xp_text: Label
-var combo_label: Label
-var radar: RadarView
-var tut_panel: PanelContainer
-var tut_title: Label
-var tut_text: Label
-var tut_prog: ProgressBar
-var prompt_panel: PanelContainer
-var prompt_label: Label
-var mine_bar: ProgressBar
-var hot_food: Label
-var hot_cell: Label
-var hot_inv: Label
-var fact_panel: PanelContainer
-var fact_label: Label
-var flash_rect: ColorRect
-var sleep_overlay: ColorRect
-var sleep_label: Label
-var letter_top: ColorRect
-var letter_bot: ColorRect
-var intro_label: Label
-var intro_msg: Label
-var modal_dim: ColorRect
-var modal_panel: PanelContainer
-var modal_title: Label
-var modal_body: VBoxContainer
-var modal_close: Button
-var toast_time := 0.0
-var hud_timer := 0.0
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  LIFECYCLE
-# ═══════════════════════════════════════════════════════════════════════════
 func _ready() -> void:
-	rng.seed = 20261115
 	var win := get_window()
-	win.title = "Mars Simulator — Master Edition II"
-	win.content_scale_size = Vector2i(1280, 720)
 	win.content_scale_mode = Window.CONTENT_SCALE_MODE_CANVAS_ITEMS
 	win.content_scale_aspect = Window.CONTENT_SCALE_ASPECT_EXPAND
+	win.content_scale_size = Vector2i(640, 640)
+	get_viewport().msaa_3d = Viewport.MSAA_2X
+	_setup_input()
+	_load_game()
+	ui = UI.new()
+	ui.main = self
+	add_child(ui)
+	orbit = OrbitWorld.new()
+	orbit.main = self
+	add_child(orbit)
+	base = BaseWorld.new()
+	base.main = self
+	add_child(base)
+	ui.minimap.base = base
+	if save["daily"] == null or int(save["daily"]["sol"]) != int(save["sol"]):
+		save["daily"] = base.new_daily(int(save["sol"]))
+	persist()
+	set_mode("orbit")
+	ui.update_hud()
 
-	_detect_hardware()
-	get_viewport().msaa_3d = q_msaa
-	_load_save()
-	streak = _compute_streak()
-	best_streak = maxi(best_streak, streak)
-	_ensure_daily()
+func _setup_input() -> void:
+	var map := {
+		"move_forward": [KEY_W, KEY_UP], "move_back": [KEY_S, KEY_DOWN],
+		"move_left": [KEY_A, KEY_LEFT], "move_right": [KEY_D, KEY_RIGHT],
+		"jump": [KEY_SPACE], "interact": [KEY_E], "sprint": [KEY_SHIFT], "missions": [KEY_M]}
+	for action in map:
+		if not InputMap.has_action(action):
+			InputMap.add_action(action)
+		for k in map[action]:
+			var ev := InputEventKey.new()
+			ev.physical_keycode = k
+			InputMap.action_add_event(action, ev)
 
-	mars_tex = _make_mars_texture(q_tex_w, q_tex_h)
-	_build_menu_world()
-	_build_surface_world()
-	rng.randomize()
-	_build_menu_ui()
-	_build_hud()
-	_build_intro_overlay()
-	_build_modal()
-	_build_fade_layer()
-	_check_streak_unlocks()
+func _load_game() -> void:
+	save = {"wallet": 0, "completed": [], "assembled": [], "active": null, "decisions": {}, "sol": 1, "daily": null, "seed": 1, "suited": false,
+		"cfg": {"name": "", "gender": "female", "helmet": "classic", "suit": 0, "skin": 1}}
+	if FileAccess.file_exists(SAVE_PATH):
+		var f := FileAccess.open(SAVE_PATH, FileAccess.READ)
+		var data = JSON.parse_string(f.get_as_text())
+		if typeof(data) == TYPE_DICTIONARY:
+			for k in data:
+				save[k] = data[k]
+	# JSON turns ints into floats: tidy the fields we compare as ints
+	save["wallet"] = int(save["wallet"])
+	save["sol"] = int(save["sol"])
+	save["seed"] = int(save["seed"])
+	save["cfg"]["suit"] = int(save["cfg"].get("suit", 0))
+	save["cfg"]["skin"] = int(save["cfg"].get("skin", 1))
+	if save["active"] != null:
+		var done: Array = []
+		for v in save["active"]["done"]:
+			done.append(int(v))
+		save["active"]["done"] = done
+		save["active"]["step"] = int(save["active"]["step"])
+	if save["daily"] != null:
+		var gh: Array = []
+		for v in save["daily"]["gh"]:
+			gh.append(int(v))
+		save["daily"]["gh"] = gh
+		save["daily"]["meals"] = int(save["daily"]["meals"])
 
-	age_slider.value = float(cadet_age)
-	_on_age_changed(float(cadet_age))
-	_apply_customization()
-	_enter_state(SimState.MENU_ORBIT)
+func persist() -> void:
+	var f := FileAccess.open(SAVE_PATH, FileAccess.WRITE)
+	if f:
+		f.store_string(JSON.stringify(save))
 
-	var tw := create_tween()
-	tw.tween_property(fade_rect, "color:a", 0.0, 1.6)
-	var tw2 := create_tween()
-	tw2.tween_property(menu_panel, "modulate:a", 1.0, 1.4).set_delay(0.7)
+func add_gems(n: int) -> void:
+	save["wallet"] = max(0, int(save["wallet"]) + n)
+	if n > 0 and save["daily"] != null:
+		save["daily"]["earned"] = int(save["daily"]["earned"]) + n
+	persist()
+	ui.update_hud()
 
+func toast(msg: String) -> void:
+	ui.toast(msg)
 
-func _notification(what: int) -> void:
-	if what == NOTIFICATION_WM_CLOSE_REQUEST:
-		_save()
+func fade(cb: Callable) -> void:
+	ui.fade(cb)
 
-
-func _process(delta: float) -> void:
-	time_accum += delta
-	if dragging and not (Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT) or Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT)):
-		dragging = false
-	match state:
-		SimState.MENU_ORBIT:
-			_process_menu(delta)
-		SimState.SURFACE:
-			_process_surface(delta)
-	_update_toast(delta)
-
-
-func _unhandled_input(event: InputEvent) -> void:
-	if event is InputEventMouseButton:
-		var mb := event as InputEventMouseButton
-		if mb.button_index == MOUSE_BUTTON_LEFT or mb.button_index == MOUSE_BUTTON_RIGHT:
-			dragging = mb.pressed
-		elif mb.pressed and mb.button_index == MOUSE_BUTTON_WHEEL_UP:
-			_zoom(-1.0)
-		elif mb.pressed and mb.button_index == MOUSE_BUTTON_WHEEL_DOWN:
-			_zoom(1.0)
-	elif event is InputEventMouseMotion and dragging:
-		_orbit((event as InputEventMouseMotion).relative)
-	elif event is InputEventKey:
-		var k := event as InputEventKey
-		if not k.pressed or k.echo:
-			return
-		if state == SimState.SURFACE and not transitioning:
-			_handle_surface_key(k.physical_keycode)
-
-
-func _handle_surface_key(code: int) -> void:
-	if intro_phase != Intro.NONE:
-		if code == KEY_SPACE or code == KEY_ENTER or code == KEY_ESCAPE:
-			_skip_intro()
-		return
-	if ui_modal != "":
-		var closes := code == KEY_ESCAPE or ((code == KEY_I or code == KEY_TAB) and ui_modal == "inventory")
-		if closes and ui_modal != "summary":
-			_close_modal()
-		return
-	match code:
-		KEY_F:
-			_on_interact_pressed()
-		KEY_E:
-			_eat_best()
-		KEY_Q:
-			_use_item("power_cell")
-		KEY_R:
-			_toggle_rover()
-		KEY_I, KEY_TAB:
-			_open_modal("inventory")
-		KEY_H:
-			_on_reset_spawn()
-		KEY_BACKSPACE:
-			if tut_active:
-				_end_tutorial(false)
-				_toast("Training skipped — replay it from the pause menu (Esc)", 4.0)
-		KEY_F9:
-			hazard = Hazard.DUST_STORM if hazard != Hazard.DUST_STORM else Hazard.SOLAR_FLARE
-			hazard_timer = 25.0
-			_toast("Hazard triggered (demo)")
-		KEY_ESCAPE:
-			_open_modal("pause")
-
-
-func _zoom(dir: float) -> void:
-	if state == SimState.MENU_ORBIT:
-		menu_dist_target = clampf(menu_dist_target + dir * 1.2, 8.5, 26.0)
+func set_mode(m: String) -> void:
+	mode = m
+	orbit.activate(m == "orbit")
+	base.activate(m != "orbit")
+	base.customizing = m == "customize"
+	if m == "customize":
+		var portrait: bool = ui._is_portrait()
+		base.cam.h_offset = 0.0 if portrait else -1.3
+		base.cam.v_offset = -1.1 if portrait else 0.0
 	else:
-		cam_dist = clampf(cam_dist + dir * 0.9, 3.5, 22.0)
+		base.cam.h_offset = 0.0
+		base.cam.v_offset = 0.0
+	ui.show_mode(m)
+
+func enter_base() -> void:
+	base.place_player_at_base()
+	set_mode("base" if save["suited"] else "customize")
+	toast("Gale Crater: 154 km wide, explored by NASA’s Curiosity rover since 2012")
+
+func go_orbit() -> void:
+	fade(_to_orbit)
+
+func _to_orbit() -> void:
+	set_mode("orbit")
+	orbit.reset_after_base()
+
+func open_customize() -> void:
+	if base.in_rover:
+		base.exit_rover(true)
+	set_mode("customize")
+
+func finish_customize() -> void:
+	save["suited"] = true
+	persist()
+	base.cam_yaw = base.p_heading + PI + 0.6
+	set_mode("base")
+	toast("Walk with WASD or the joystick, jump with Space. Collect the glowing gems!")
 
 
-func _orbit(rel: Vector2) -> void:
-	if state == SimState.MENU_ORBIT:
-		menu_yaw -= rel.x * 0.006
-		menu_pitch = clampf(menu_pitch + rel.y * 0.006, -1.2, 1.2)
-	else:
-		cam_yaw -= rel.x * 0.005
-		cam_pitch = clampf(cam_pitch + rel.y * 0.005, 0.08, 1.25)
-		tut_cam_drag += rel.length()
+# ======================================================================
+# Mesh, material and label helpers
+# ======================================================================
+class Mk extends RefCounted:
+	static var _mats := {}
 
+	static func col(hex: String) -> Color:
+		return Color(hex)
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  HARDWARE / AGE BRANCH
-# ═══════════════════════════════════════════════════════════════════════════
-func _detect_hardware() -> void:
-	q_os = OS.get_name()
-	q_cores = OS.get_processor_count()
-	if q_os in ["Android", "iOS", "Web"] or q_cores <= 2:
-		q_tier = "LOW"
-	elif q_cores <= 4:
-		q_tier = "MEDIUM"
-	else:
-		q_tier = "HIGH"
-	match q_tier:
-		"HIGH":
-			q_globe_seg = 160
-			q_globe_rings = 80
-			q_rocks = 600
-			q_pebbles = 1400
-			q_stars = 600
-			q_volumetric = true
-		"MEDIUM":
-			q_globe_seg = 96
-			q_globe_rings = 48
-			q_tex_w = 512
-			q_tex_h = 256
-			q_ground = 192
-			q_rocks = 320
-			q_pebbles = 700
-			q_stars = 350
-			q_msaa = Viewport.MSAA_2X
-		_:
-			q_shadows = false
-			q_globe_seg = 48
-			q_globe_rings = 24
-			q_tex_w = 384
-			q_tex_h = 192
-			q_ground = 128
-			q_rocks = 140
-			q_pebbles = 250
-			q_stars = 200
-			q_glow = false
-			q_particles = false
-			q_ssao = false
-			q_lights = false
-			q_msaa = Viewport.MSAA_DISABLED
+	static func mat(c: Color, rough := 0.7, metal := 0.0) -> StandardMaterial3D:
+		var key := "s%s_%.2f_%.2f" % [c.to_html(), rough, metal]
+		if _mats.has(key):
+			return _mats[key]
+		var m := StandardMaterial3D.new()
+		m.albedo_color = c
+		m.roughness = rough
+		m.metallic = metal
+		_mats[key] = m
+		return m
 
-
-func _bracket_for(age: int) -> int:
-	for i in BRACKETS.size():
-		var b: Dictionary = BRACKETS[i]
-		if age <= int(b["max"]):
-			return i
-	return BRACKETS.size() - 1
-
-
-func _br() -> Dictionary:
-	return BRACKETS[bracket]
-
-
-func _difficulty_for() -> float:
-	return float(_br()["drain"]) * (1.0 + 0.08 * float(expedition - 1))
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  SMALL BUILDERS
-# ═══════════════════════════════════════════════════════════════════════════
-func _mat(color: Color, metallic := 0.0, rough := 0.8, emit := Color.BLACK, emit_energy := 0.0) -> StandardMaterial3D:
-	var m := StandardMaterial3D.new()
-	m.albedo_color = color
-	m.metallic = metallic
-	m.roughness = rough
-	if emit_energy > 0.0:
+	static func emissive(c: Color, energy := 1.0) -> StandardMaterial3D:
+		var key := "e%s_%.2f" % [c.to_html(), energy]
+		if _mats.has(key):
+			return _mats[key]
+		var m := StandardMaterial3D.new()
+		m.albedo_color = c
 		m.emission_enabled = true
-		m.emission = emit
-		m.emission_energy_multiplier = emit_energy
-	return m
-
-
-func _glass(color: Color) -> StandardMaterial3D:
-	var m := StandardMaterial3D.new()
-	m.albedo_color = color
-	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	m.roughness = 0.05
-	m.metallic = 0.3
-	return m
-
-
-func _additive(col: Color) -> StandardMaterial3D:
-	var m := StandardMaterial3D.new()
-	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	m.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
-	m.cull_mode = BaseMaterial3D.CULL_DISABLED
-	m.albedo_color = col
-	return m
-
-
-func _add_mesh(parent: Node, mesh: Mesh, mat: Material, pos := Vector3.ZERO, rot_deg := Vector3.ZERO) -> MeshInstance3D:
-	var mi := MeshInstance3D.new()
-	mi.mesh = mesh
-	mi.material_override = mat
-	mi.position = pos
-	mi.rotation_degrees = rot_deg
-	if mat is BaseMaterial3D and (mat as BaseMaterial3D).transparency != BaseMaterial3D.TRANSPARENCY_DISABLED:
-		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	parent.add_child(mi)
-	return mi
-
-
-func _box(size: Vector3) -> BoxMesh:
-	var m := BoxMesh.new()
-	m.size = size
-	return m
-
-
-func _cyl(r_top: float, r_bottom: float, h: float, seg := 24) -> CylinderMesh:
-	var m := CylinderMesh.new()
-	m.top_radius = r_top
-	m.bottom_radius = r_bottom
-	m.height = h
-	m.radial_segments = seg
-	m.rings = 1
-	return m
-
-
-func _sph(r: float, seg := 24, rings := 12, hemi := false) -> SphereMesh:
-	var m := SphereMesh.new()
-	m.radius = r
-	m.height = r if hemi else r * 2.0
-	m.is_hemisphere = hemi
-	m.radial_segments = seg
-	m.rings = rings
-	return m
-
-
-func _cap(r: float, h: float) -> CapsuleMesh:
-	var m := CapsuleMesh.new()
-	m.radius = r
-	m.height = maxf(h, r * 2.0 + 0.01)
-	m.radial_segments = 16
-	m.rings = 6
-	return m
-
-
-func _line_mesh(parent: Node3D, a: Vector3, b: Vector3, r: float, mat: Material) -> void:
-	var d := b - a
-	var seg_len := d.length()
-	if seg_len < 0.001:
-		return
-	var y := d / seg_len
-	var ref := Vector3.RIGHT if absf(y.dot(Vector3.RIGHT)) < 0.9 else Vector3.FORWARD
-	var x := ref.cross(y).normalized()
-	var z := x.cross(y).normalized()
-	var mi := MeshInstance3D.new()
-	mi.mesh = _cyl(r, r, seg_len, 6)
-	mi.material_override = mat
-	mi.transform = Transform3D(Basis(x, y, z), (a + b) * 0.5)
-	parent.add_child(mi)
-
-
-func _make_particles(amount: int, life: float, col: Color, smin: float, smax: float, additive := false) -> CPUParticles3D:
-	var p := CPUParticles3D.new()
-	p.amount = amount
-	p.lifetime = life
-	p.emitting = false
-	p.local_coords = false
-	var q := QuadMesh.new()
-	q.size = Vector2(1, 1)
-	var m := StandardMaterial3D.new()
-	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	m.billboard_mode = BaseMaterial3D.BILLBOARD_PARTICLES
-	m.vertex_color_use_as_albedo = true
-	if additive:
-		m.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
-	q.material = m
-	p.mesh = q
-	p.color = col
-	p.scale_amount_min = smin
-	p.scale_amount_max = smax
-	var curve := Curve.new()
-	curve.add_point(Vector2(0.0, 0.3))
-	curve.add_point(Vector2(0.3, 1.0))
-	curve.add_point(Vector2(1.0, 0.0))
-	p.scale_amount_curve = curve
-	var g := Gradient.new()
-	g.offsets = PackedFloat32Array([0.0, 1.0])
-	g.colors = PackedColorArray([Color(1, 1, 1, 1), Color(1, 1, 1, 0)])
-	p.color_ramp = g
-	return p
-
-
-func _make_env(bg: Color, ambient: Color, ambient_energy: float) -> Environment:
-	var e := Environment.new()
-	e.background_mode = Environment.BG_COLOR
-	e.background_color = bg
-	e.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	e.ambient_light_color = ambient
-	e.ambient_light_energy = ambient_energy
-	e.tonemap_mode = Environment.TONE_MAPPER_FILMIC
-	if q_glow:
-		e.glow_enabled = true
-		e.glow_intensity = 0.8
-		e.glow_strength = 1.0
-	return e
-
-
-func _w(x: float, z: float) -> Vector3:
-	return HAB_POS + Vector3(x, 0.0, z)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  PROCEDURAL TEXTURES
-# ═══════════════════════════════════════════════════════════════════════════
-func _make_mars_texture(w: int, h: int) -> ImageTexture:
-	var big := FastNoiseLite.new()
-	big.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
-	big.seed = 4242
-	big.frequency = 1.5
-	big.fractal_type = FastNoiseLite.FRACTAL_FBM
-	big.fractal_octaves = 5
-	var fine := FastNoiseLite.new()
-	fine.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
-	fine.seed = 99
-	fine.frequency = 9.0
-	var rust_dark := Color(0.36, 0.17, 0.10)
-	var rust_light := Color(0.80, 0.46, 0.26)
-	var basalt := Color(0.20, 0.12, 0.10)
-	var ice := Color(0.95, 0.93, 0.92)
-	var img := Image.create(w, h, false, Image.FORMAT_RGB8)
-	for y in h:
-		var lat := (0.5 - (float(y) + 0.5) / float(h)) * PI
-		var cl := cos(lat)
-		var sl := sin(lat)
-		for x in w:
-			var lon := ((float(x) + 0.5) / float(w) - 0.5) * TAU
-			var px := cl * sin(lon)
-			var pz := cl * cos(lon)
-			var n := big.get_noise_3d(px, sl, pz)
-			var d := fine.get_noise_3d(px, sl, pz)
-			var t := clampf(n * 0.5 + 0.5 + d * 0.10, 0.0, 1.0)
-			var col := rust_dark.lerp(rust_light, smoothstep(0.25, 0.75, t))
-			if n < -0.22:
-				col = col.lerp(basalt, clampf((-0.22 - n) * 2.4, 0.0, 1.0) * 0.8)
-			col = col.lerp(ice, smoothstep(0.86, 0.94, absf(sl)))
-			img.set_pixel(x, y, col)
-	img.generate_mipmaps()
-	return ImageTexture.create_from_image(img)
-
-
-func _make_ground_textures(size: int) -> Array:
-	var a := FastNoiseLite.new()
-	a.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
-	a.seed = 77
-	a.frequency = 0.02
-	a.fractal_type = FastNoiseLite.FRACTAL_FBM
-	a.fractal_octaves = 4
-	var b := FastNoiseLite.new()
-	b.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
-	b.seed = 78
-	b.frequency = 0.16
-	var base := Color(0.60, 0.33, 0.19)
-	var dark := Color(0.38, 0.20, 0.12)
-	var light := Color(0.76, 0.48, 0.29)
-	var img := Image.create(size, size, false, Image.FORMAT_RGB8)
-	var bump := Image.create(size, size, false, Image.FORMAT_RGB8)
-	var s := float(size)
-	for y in size:
-		var fy := float(y) / s
-		for x in size:
-			var fx := float(x) / s
-			# 4-sample blend => seamless tiling
-			var big := lerpf(
-				lerpf(a.get_noise_2d(x, y), a.get_noise_2d(x - size, y), fx),
-				lerpf(a.get_noise_2d(x, y - size), a.get_noise_2d(x - size, y - size), fx), fy)
-			var grain := lerpf(
-				lerpf(b.get_noise_2d(x, y), b.get_noise_2d(x - size, y), fx),
-				lerpf(b.get_noise_2d(x, y - size), b.get_noise_2d(x - size, y - size), fx), fy)
-			var ripple := sin(fx * TAU * 12.0 + fy * TAU * 3.0 + big * 6.0) * 0.5 + 0.5
-			var t := clampf(big * 1.6 + 0.5, 0.0, 1.0)
-			var col := dark.lerp(base, smoothstep(0.0, 0.5, t)).lerp(light, smoothstep(0.5, 1.0, t))
-			col = col * (1.0 + grain * 0.18 + (ripple - 0.5) * 0.06)
-			img.set_pixel(x, y, col)
-			var hgt := clampf(0.5 + big * 0.6 + grain * 0.25 + (ripple - 0.5) * 0.25, 0.0, 1.0)
-			bump.set_pixel(x, y, Color(hgt, hgt, hgt))
-	img.generate_mipmaps()
-	bump.bump_map_to_normal_map(6.0)
-	bump.generate_mipmaps()
-	return [ImageTexture.create_from_image(img), ImageTexture.create_from_image(bump)]
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  MENU WORLD  (spinning Mars + Gale beacon)
-# ═══════════════════════════════════════════════════════════════════════════
-func _build_menu_world() -> void:
-	menu_root = Node3D.new()
-	menu_root.name = "MenuWorld"
-	add_child(menu_root)
-
-	var star_mm := MultiMesh.new()
-	star_mm.transform_format = MultiMesh.TRANSFORM_3D
-	star_mm.mesh = _sph(0.12, 4, 2)
-	star_mm.instance_count = q_stars
-	for i in q_stars:
-		var dir := Vector3(rng.randfn(), rng.randfn(), rng.randfn())
-		if dir.length() < 0.01:
-			dir = Vector3.UP
-		var s := rng.randf_range(0.4, 1.5)
-		star_mm.set_instance_transform(i, Transform3D(Basis().scaled(Vector3(s, s, s)), dir.normalized() * 95.0))
-	var stars := MultiMeshInstance3D.new()
-	stars.multimesh = star_mm
-	stars.material_override = _mat(Color(1, 0.95, 0.9), 0.0, 1.0, Color(1, 0.95, 0.9), 2.0)
-	stars.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	menu_root.add_child(stars)
-
-	globe_spin = Node3D.new()
-	menu_root.add_child(globe_spin)
-	var gm := _mat(Color.WHITE, 0.0, 1.0)
-	gm.albedo_texture = mars_tex
-	gm.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS_ANISOTROPIC
-	gm.rim_enabled = true
-	gm.rim = 0.7
-	gm.rim_tint = 0.6
-	_add_mesh(globe_spin, _sph(GLOBE_RADIUS, q_globe_seg, q_globe_rings), gm)
-
-	var sh := Shader.new()
-	sh.code = ATMO_SHADER
-	var smat := ShaderMaterial.new()
-	smat.shader = sh
-	var atmo := _add_mesh(menu_root, _sph(GLOBE_RADIUS * 1.04, maxi(q_globe_seg / 2, 32), maxi(q_globe_rings / 2, 16)), smat)
-	atmo.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-
-	var lat := deg_to_rad(GALE_LAT_DEG)
-	var lon := deg_to_rad(GALE_LON_DEG)
-	var n := Vector3(cos(lat) * sin(lon), sin(lat), cos(lat) * cos(lon))
-	var ref := Vector3.UP if absf(n.dot(Vector3.UP)) < 0.99 else Vector3.RIGHT
-	var bx := ref.cross(n).normalized()
-	var bz := bx.cross(n).normalized()
-	beacon_pin = Node3D.new()
-	beacon_pin.transform = Transform3D(Basis(bx, n, bz), n * GLOBE_RADIUS)
-	globe_spin.add_child(beacon_pin)
-	var red := _mat(Color(1.0, 0.15, 0.1), 0.0, 0.4, Color(1.0, 0.15, 0.1), 4.0)
-	_add_mesh(beacon_pin, _cyl(0.02, 0.02, 0.7, 8), red, Vector3(0, 0.35, 0))
-	_add_mesh(beacon_pin, _sph(0.09, 16, 8), red, Vector3(0, 0.72, 0))
-	beacon_halo = _add_mesh(beacon_pin, _sph(0.2, 16, 8), _additive(Color(1.0, 0.2, 0.1, 0.35)), Vector3(0, 0.72, 0))
-	beacon_ring_mat = StandardMaterial3D.new()
-	beacon_ring_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	beacon_ring_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	beacon_ring_mat.albedo_color = Color(1.0, 0.3, 0.2, 1.0)
-	var torus := TorusMesh.new()
-	torus.inner_radius = 0.16
-	torus.outer_radius = 0.2
-	torus.rings = 32
-	torus.ring_segments = 8
-	beacon_ring = _add_mesh(beacon_pin, torus, beacon_ring_mat, Vector3(0, 0.02, 0))
-	var bl := OmniLight3D.new()
-	bl.light_color = Color(1.0, 0.25, 0.15)
-	bl.light_energy = 1.6
-	bl.omni_range = 2.5
-	bl.position = Vector3(0, 0.75, 0)
-	beacon_pin.add_child(bl)
-
-	menu_pivot = Node3D.new()
-	menu_root.add_child(menu_pivot)
-	menu_camera = Camera3D.new()
-	menu_camera.fov = 42.0
-	menu_camera.far = 400.0
-	menu_camera.position = Vector3(0, 0, menu_dist)
-	menu_camera.environment = _make_env(Color(0.008, 0.004, 0.012), Color(0.20, 0.10, 0.08), 0.35)
-	menu_pivot.add_child(menu_camera)
-	var key := DirectionalLight3D.new()
-	key.rotation_degrees = Vector3(-18.0, 38.0, 0.0)
-	key.light_color = Color(1.0, 0.93, 0.85)
-	key.light_energy = 1.7
-	menu_pivot.add_child(key)
-	var back := DirectionalLight3D.new()
-	back.rotation_degrees = Vector3(14.0, 200.0, 0.0)
-	back.light_color = Color(1.0, 0.45, 0.25)
-	back.light_energy = 0.55
-	menu_pivot.add_child(back)
-
-
-func _process_menu(delta: float) -> void:
-	globe_spin.rotate_y(delta * 0.12)
-	if not dragging:
-		menu_yaw += delta * 0.03
-	menu_dist = lerpf(menu_dist, menu_dist_target, clampf(delta * 5.0, 0.0, 1.0))
-	menu_camera.position.z = menu_dist
-	menu_pivot.rotation = Vector3(menu_pitch, menu_yaw, 0.0)
-	var s := 1.0 + 0.35 * sin(time_accum * 4.0)
-	beacon_halo.scale = Vector3(s, s, s)
-	var f := fmod(time_accum * 0.9, 1.0)
-	var rs := 1.0 + f * 2.6
-	beacon_ring.scale = Vector3(rs, 1.0, rs)
-	beacon_ring_mat.albedo_color = Color(1.0, 0.3, 0.2, 1.0 - f)
-	var wp := beacon_pin.global_position
-	var out_n := (wp - globe_spin.global_position).normalized()
-	var to_cam := (menu_camera.global_position - wp).normalized()
-	var facing := out_n.dot(to_cam) > 0.12 and not menu_camera.is_position_behind(wp)
-	pin_label.visible = facing
-	if facing:
-		pin_label.position = menu_camera.unproject_position(wp) + Vector2(20.0, -44.0)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  SURFACE WORLD  (flat crater floor — the old rim / Mount Sharp relief is gone)
-# ═══════════════════════════════════════════════════════════════════════════
-func _build_surface_world() -> void:
-	surface_root = Node3D.new()
-	surface_root.name = "SurfaceWorld"
-	add_child(surface_root)
-	base_rect = Rect2(HAB_POS.x + BASE_MIN.x, HAB_POS.z + BASE_MIN.y, BASE_MAX.x - BASE_MIN.x, BASE_MAX.y - BASE_MIN.y)
-
-	surface_env = Environment.new()
-	var sky_mat := ProceduralSkyMaterial.new()
-	sky_mat.sky_top_color = Color(0.30, 0.20, 0.18)
-	sky_mat.sky_horizon_color = Color(0.86, 0.62, 0.44)
-	sky_mat.ground_horizon_color = Color(0.74, 0.50, 0.36)
-	sky_mat.ground_bottom_color = Color(0.40, 0.26, 0.19)
-	sky_mat.sky_curve = 0.15
-	sky_mat.sun_angle_max = 8.0
-	sky_mat.sun_curve = 0.1
-	var sky := Sky.new()
-	sky.sky_material = sky_mat
-	surface_env.background_mode = Environment.BG_SKY
-	surface_env.sky = sky
-	surface_env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	surface_env.ambient_light_color = Color(0.62, 0.44, 0.34)
-	surface_env.ambient_light_energy = 0.75
-	surface_env.tonemap_mode = Environment.TONE_MAPPER_FILMIC
-	surface_env.tonemap_exposure = 1.05
-	surface_env.fog_enabled = true
-	surface_env.fog_light_color = COL_FOG_CLEAR
-	surface_env.fog_density = FOG_BASE
-	surface_env.fog_sky_affect = 0.35
-	surface_env.adjustment_enabled = true
-	surface_env.adjustment_contrast = 1.08
-	surface_env.adjustment_saturation = 1.12
-	if q_glow:
-		surface_env.glow_enabled = true
-		surface_env.glow_intensity = 0.65
-		surface_env.glow_bloom = 0.06
-	if q_ssao:
-		surface_env.ssao_enabled = true
-		surface_env.ssao_radius = 1.2
-		surface_env.ssao_intensity = 1.6
-	if q_volumetric:
-		surface_env.volumetric_fog_enabled = true
-		surface_env.volumetric_fog_density = 0.005
-		surface_env.volumetric_fog_albedo = Color(0.88, 0.62, 0.46)
-		surface_env.volumetric_fog_length = 90.0
-
-	surface_camera = Camera3D.new()
-	surface_camera.fov = 65.0
-	surface_camera.near = 0.1
-	surface_camera.far = 3000.0
-	surface_camera.environment = surface_env
-	surface_root.add_child(surface_camera)
-
-	surface_sun = DirectionalLight3D.new()
-	surface_sun.rotation_degrees = Vector3(-38.0, -35.0, 0.0)
-	surface_sun.light_color = Color(1.0, 0.88, 0.75)
-	surface_sun.light_energy = 1.25
-	surface_sun.shadow_enabled = q_shadows
-	surface_sun.shadow_blur = 1.5
-	surface_sun.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
-	surface_sun.directional_shadow_max_distance = 120.0
-	surface_root.add_child(surface_sun)
-
-	var plane := PlaneMesh.new()
-	plane.size = Vector2(1200, 1200)
-	var tex := _make_ground_textures(q_ground)
-	var gmat := _mat(Color.WHITE, 0.0, 1.0)
-	gmat.albedo_texture = tex[0]
-	gmat.normal_enabled = true
-	gmat.normal_texture = tex[1]
-	gmat.normal_scale = 0.8
-	gmat.uv1_scale = Vector3(90, 90, 1)
-	gmat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS_ANISOTROPIC
-	_add_mesh(surface_root, plane, gmat).name = "CraterFloor"
-
-	_build_habitat()
-	_build_outdoor()
-	_build_capsule()
-	_build_rocks()
-	_build_astronaut()
-	_build_rover()
-	_build_objective_marker()
-
-	dust_particles = _make_particles(120, 2.2, Color(0.82, 0.55, 0.34, 0.2), 3.0, 7.0)
-	dust_particles.emission_shape = CPUParticles3D.EMISSION_SHAPE_BOX
-	dust_particles.emission_box_extents = Vector3(25, 4, 25)
-	dust_particles.direction = Vector3(1, 0.05, 0.25)
-	dust_particles.spread = 12.0
-	dust_particles.gravity = Vector3.ZERO
-	dust_particles.initial_velocity_min = 20.0
-	dust_particles.initial_velocity_max = 32.0
-	dust_particles.position = Vector3(0, 0, -8)
-	surface_camera.add_child(dust_particles)
-
-	motes = _make_particles(60, 6.0, Color(1.0, 0.8, 0.6, 0.35), 0.04, 0.09)
-	motes.emission_shape = CPUParticles3D.EMISSION_SHAPE_BOX
-	motes.emission_box_extents = Vector3(10, 4, 10)
-	motes.direction = Vector3(1, 0.2, 0)
-	motes.gravity = Vector3(0, -0.05, 0)
-	motes.initial_velocity_min = 0.3
-	motes.initial_velocity_max = 0.9
-	motes.position = Vector3(0, 0, -5)
-	motes.emitting = q_particles
-	surface_camera.add_child(motes)
-
-	burst_fx = _make_particles(40, 0.9, Color.WHITE, 0.12, 0.3, true)
-	burst_fx.one_shot = true
-	burst_fx.explosiveness = 0.95
-	burst_fx.direction = Vector3.UP
-	burst_fx.spread = 70.0
-	burst_fx.initial_velocity_min = 3.0
-	burst_fx.initial_velocity_max = 7.0
-	burst_fx.gravity = Vector3(0, -6, 0)
-	surface_root.add_child(burst_fx)
-
-
-func _build_rocks() -> void:
-	var rock_mat := _mat(Color.WHITE, 0.0, 1.0)
-	rock_mat.vertex_color_use_as_albedo = true
-	for pass_i in 2:
-		var count := q_rocks if pass_i == 0 else q_pebbles
-		var mm := MultiMesh.new()
-		mm.transform_format = MultiMesh.TRANSFORM_3D
-		mm.use_colors = true
-		mm.mesh = _sph(0.5, 8 if pass_i == 0 else 5, 5 if pass_i == 0 else 3)
-		mm.instance_count = count
-		for i in count:
-			var pos := Vector3.ZERO
-			for attempt in 20:
-				var ang := rng.randf() * TAU
-				var rad := sqrt(rng.randf()) * (300.0 if pass_i == 0 else 90.0)
-				pos = Vector3(cos(ang) * rad, 0.0, sin(ang) * rad)
-				if _clear_of_structures(pos, 1.5):
-					break
-			var sc := rng.randf_range(0.4, 2.2) if pass_i == 0 else rng.randf_range(0.08, 0.28)
-			var b := Basis(Vector3.UP, rng.randf() * TAU).scaled(Vector3(sc * rng.randf_range(0.8, 1.5), sc * rng.randf_range(0.4, 0.8), sc))
-			mm.set_instance_transform(i, Transform3D(b, Vector3(pos.x, 0.03, pos.z)))
-			mm.set_instance_color(i, Color(0.28, 0.17, 0.12).lerp(Color(0.52, 0.32, 0.21), rng.randf()))
-		var mmi := MultiMeshInstance3D.new()
-		mmi.multimesh = mm
-		mmi.material_override = rock_mat
-		if pass_i == 1:
-			mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-		surface_root.add_child(mmi)
-
-
-# ───────────────────────────── HABITAT ──────────────────────────────────────
-func _build_habitat() -> void:
-	hab_root = Node3D.new()
-	hab_root.name = "BaseAlpha"
-	hab_root.position = HAB_POS
-	surface_root.add_child(hab_root)
-	roof_root = Node3D.new()
-	hab_root.add_child(roof_root)
-
-	hm_hull = _mat(Color(0.90, 0.90, 0.92), 0.25, 0.45)
-	hm_trim = _mat(Color(0.30, 0.32, 0.37), 0.6, 0.4)
-	hm_glow = _mat(Color(0.2, 0.8, 1.0), 0.0, 0.3, Color(0.2, 0.8, 1.0), 2.2)
-	hm_amber = _mat(Color(1.0, 0.7, 0.3), 0.0, 0.3, Color(1.0, 0.7, 0.3), 2.5)
-	hm_dark = _mat(Color(0.14, 0.14, 0.17), 0.4, 0.6)
-	hm_screen = _mat(Color(0.05, 0.12, 0.2), 0.2, 0.2, Color(0.25, 0.75, 1.0), 1.6)
-	hm_wood = _mat(Color(0.55, 0.38, 0.24), 0.0, 0.7)
-
-	_room("COMMAND HUB", -9, -9, 9, 9, Color(0.26, 0.27, 0.30), Color(0.75, 0.9, 1.0))
-	_room("CREW QUARTERS", -25, -7, -9, 7, Color(0.42, 0.30, 0.22), Color(1.0, 0.8, 0.6))
-	_room("GALLEY", 9, -7, 25, 7, Color(0.70, 0.70, 0.68), Color(1.0, 0.95, 0.85))
-	_room("GREENHOUSE", -8, -27, 8, -9, Color(0.30, 0.22, 0.14), Color(1.0, 0.55, 0.95), true)
-	_room("WORKSHOP", 9, -23, 25, -7, Color(0.35, 0.35, 0.36), Color(1.0, 0.85, 0.6))
-	_room("STORAGE BAY", -25, -23, -9, -7, Color(0.24, 0.23, 0.24), Color(0.8, 0.85, 1.0))
-
-	_hwall(9.0, -9.0, 9.0, [Vector2(0.0, 3.2)])       # hub south = airlock
-	_hwall(-9.0, -9.0, 9.0, [Vector2(0.0, 3.0)])      # hub / greenhouse
-	_vwall(-9.0, -9.0, 9.0, [Vector2(0.0, 3.0)])      # hub / quarters
-	_vwall(9.0, -9.0, 9.0, [Vector2(0.0, 3.0)])       # hub / galley
-	_hwall(-7.0, -25.0, -9.0, [Vector2(-17.0, 3.0)])  # quarters / storage
-	_hwall(7.0, -25.0, -9.0, [])
-	_vwall(-25.0, -7.0, 7.0, [])
-	_hwall(-7.0, 9.0, 25.0, [Vector2(17.0, 3.0)])     # galley / workshop
-	_hwall(7.0, 9.0, 25.0, [])
-	_vwall(25.0, -7.0, 7.0, [])
-	_vwall(-8.0, -27.0, -9.0, [])
-	_vwall(8.0, -27.0, -9.0, [])
-	_hwall(-27.0, -8.0, 8.0, [])
-	_hwall(-23.0, 9.0, 25.0, [])
-	_vwall(25.0, -23.0, -7.0, [])
-	_vwall(9.0, -23.0, -9.0, [])
-	_hwall(-23.0, -25.0, -9.0, [])
-	_vwall(-25.0, -23.0, -7.0, [Vector2(-15.0, 3.6)]) # storage bay exterior door
-	_vwall(-9.0, -23.0, -9.0, [])
-
-	# central dome on the roof
-	_add_mesh(roof_root, _sph(6.5, 40, 12, true), hm_hull, Vector3(0, WALL_H + 0.3, 0))
-	_add_mesh(roof_root, _cyl(6.6, 6.6, 0.3, 40), hm_glow, Vector3(0, WALL_H + 0.45, 0))
-	_add_mesh(roof_root, _cyl(1.4, 1.4, 0.3, 24), _glass(Color(0.6, 0.9, 1.0, 0.5)), Vector3(0, WALL_H + 6.7, 0))
-
-	_build_hub_props()
-	_build_quarters_props()
-	_build_galley_props()
-	_build_greenhouse_props()
-	_build_workshop_props()
-	_build_storage_props()
-
-
-func _room(title: String, x0: float, z0: float, x1: float, z1: float, floor_col: Color, light_col: Color, glass := false) -> void:
-	var cx := (x0 + x1) * 0.5
-	var cz := (z0 + z1) * 0.5
-	var sx := x1 - x0
-	var sz := z1 - z0
-	_add_mesh(hab_root, _box(Vector3(sx, 0.1, sz)), _mat(floor_col, 0.15, 0.7), Vector3(cx, 0.05, cz))
-	var roof_mat: Material = _glass(Color(0.6, 0.9, 1.0, 0.3)) if glass else hm_hull
-	_add_mesh(roof_root, _box(Vector3(sx + 0.4, 0.3, sz + 0.4)), roof_mat, Vector3(cx, WALL_H + 0.15, cz))
-	_add_mesh(roof_root, _box(Vector3(sx * 0.6, 0.06, 0.4)), hm_glow, Vector3(cx, WALL_H + 0.33, cz))
-	if q_lights:
-		var l := OmniLight3D.new()
-		l.light_color = light_col
-		l.light_energy = 1.7
-		l.omni_range = maxf(sx, sz) * 0.85
-		l.position = Vector3(cx, WALL_H - 0.4, cz)
-		hab_root.add_child(l)
-	rooms.append({"name": title, "rect": Rect2(HAB_POS.x + x0, HAB_POS.z + z0, sx, sz)})
-
-
-func _wall_seg(x0: float, z0: float, x1: float, z1: float) -> void:
-	var sx := maxf(absf(x1 - x0), 0.35)
-	var sz := maxf(absf(z1 - z0), 0.35)
-	var c := Vector3((x0 + x1) * 0.5, WALL_H * 0.5, (z0 + z1) * 0.5)
-	_add_mesh(hab_root, _box(Vector3(sx, WALL_H, sz)), hm_hull, c)
-	_add_mesh(hab_root, _box(Vector3(sx + 0.06, 0.35, sz + 0.06)), hm_trim, Vector3(c.x, 0.18, c.z))
-	_add_mesh(hab_root, _box(Vector3(sx + 0.04, 0.12, sz + 0.04)), hm_glow, Vector3(c.x, WALL_H - 0.35, c.z))
-	_add_rect_local(c.x, c.z, sx, sz)
-
-
-func _door_frame(c: Vector3, w: float, along_x: bool) -> void:
-	var off := w * 0.5 + 0.15
-	var post := Vector3(0.3, WALL_H, 0.5) if along_x else Vector3(0.5, WALL_H, 0.3)
-	for sgn in [-1.0, 1.0]:
-		var p := Vector3(c.x + off * sgn, WALL_H * 0.5, c.z) if along_x else Vector3(c.x, WALL_H * 0.5, c.z + off * sgn)
-		_add_mesh(hab_root, _box(post), hm_trim, p)
-	var lintel := Vector3(w, 0.6, 0.45) if along_x else Vector3(0.45, 0.6, w)
-	_add_mesh(hab_root, _box(lintel), hm_trim, Vector3(c.x, WALL_H - 0.3, c.z))
-	var strip := Vector3(w, 0.08, 0.5) if along_x else Vector3(0.5, 0.08, w)
-	_add_mesh(hab_root, _box(strip), hm_amber, Vector3(c.x, WALL_H - 0.62, c.z))
-
-
-func _hwall(z: float, x0: float, x1: float, gaps: Array) -> void:
-	var cur := x0
-	for g in gaps:
-		var gv: Vector2 = g
-		var a := gv.x - gv.y * 0.5
-		if a > cur + 0.05:
-			_wall_seg(cur, z, a, z)
-		_door_frame(Vector3(gv.x, 0.0, z), gv.y, true)
-		cur = gv.x + gv.y * 0.5
-	if x1 > cur + 0.05:
-		_wall_seg(cur, z, x1, z)
-
-
-func _vwall(x: float, z0: float, z1: float, gaps: Array) -> void:
-	var cur := z0
-	for g in gaps:
-		var gv: Vector2 = g
-		var a := gv.x - gv.y * 0.5
-		if a > cur + 0.05:
-			_wall_seg(x, cur, x, a)
-		_door_frame(Vector3(x, 0.0, gv.x), gv.y, false)
-		cur = gv.x + gv.y * 0.5
-	if z1 > cur + 0.05:
-		_wall_seg(x, cur, x, z1)
-
-
-func _pbox(size: Vector3, mat: Material, lp: Vector3, collide := false) -> MeshInstance3D:
-	var mi := _add_mesh(hab_root, _box(size), mat, lp)
-	if collide:
-		_add_rect_local(lp.x, lp.z, size.x, size.z)
-	return mi
-
-
-func _plant_pot(lp: Vector3) -> void:
-	_add_mesh(hab_root, _cyl(0.45, 0.35, 0.7, 16), hm_trim, lp + Vector3(0, 0.35, 0))
-	var leaf := _mat(Color(0.2, 0.55, 0.25), 0.0, 0.8)
-	for i in 4:
-		var o := Vector3(rng.randf_range(-0.25, 0.25), 0.9 + float(i) * 0.18, rng.randf_range(-0.25, 0.25))
-		_add_mesh(hab_root, _sph(0.38 - float(i) * 0.05, 10, 6), leaf, lp + o)
-	_add_circle(HAB_POS.x + lp.x, HAB_POS.z + lp.z, 0.6)
-
-
-func _sign(text: String, lp: Vector3, rot_y: float, size := 48, col := Color(0.1, 0.1, 0.15)) -> void:
-	var s := Label3D.new()
-	s.text = text
-	s.font_size = size
-	s.pixel_size = 0.01
-	s.modulate = col
-	s.outline_size = 0
-	s.position = lp
-	s.rotation_degrees = Vector3(0, rot_y, 0)
-	hab_root.add_child(s)
-
-
-func _build_hub_props() -> void:
-	# holo-table with spinning Mars hologram
-	_add_mesh(hab_root, _cyl(1.45, 1.7, 0.9, 32), hm_trim, Vector3(0, 0.45, 0))
-	_add_mesh(hab_root, _cyl(1.5, 1.5, 0.07, 32), hm_glow, Vector3(0, 0.93, 0))
-	_add_mesh(hab_root, _cyl(0.9, 1.3, 1.1, 24), _additive(Color(0.2, 0.7, 1.0, 0.12)), Vector3(0, 1.5, 0))
-	holo_globe = Node3D.new()
-	holo_globe.position = Vector3(0, 2.15, 0)
-	hab_root.add_child(holo_globe)
-	var gm := _mat(Color.WHITE, 0.0, 0.8, Color(1.0, 0.55, 0.35), 0.5)
-	gm.albedo_texture = mars_tex
-	_add_mesh(holo_globe, _sph(0.7, 32, 16), gm)
-	var ring := TorusMesh.new()
-	ring.inner_radius = 0.95
-	ring.outer_radius = 1.0
-	_add_mesh(holo_globe, ring, hm_glow, Vector3.ZERO, Vector3(18, 0, 0))
-	_add_circle(HAB_POS.x, HAB_POS.z, 1.9)
-	var floor_ring := TorusMesh.new()
-	floor_ring.inner_radius = 4.0
-	floor_ring.outer_radius = 4.2
-	floor_ring.rings = 64
-	_add_mesh(hab_root, floor_ring, hm_amber, Vector3(0, 0.1, 0)).scale = Vector3(1, 0.2, 1)
-	for sx in [-1.0, 1.0]:
-		for sz in [-1.0, 1.0]:
-			var px: float = sx * 5.0
-			var pz: float = sz * 5.0
-			_add_mesh(hab_root, _cyl(0.28, 0.32, WALL_H, 16), hm_trim, Vector3(px, WALL_H * 0.5, pz))
-			_add_mesh(hab_root, _cyl(0.33, 0.33, 0.1, 16), hm_glow, Vector3(px, 2.4, pz))
-			_add_circle(HAB_POS.x + px, HAB_POS.z + pz, 0.4)
-	# mission control terminal
-	_pbox(Vector3(2.4, 1.0, 0.9), hm_trim, Vector3(-6.0, 0.5, -7.6), true)
-	_add_mesh(hab_root, _box(Vector3(2.2, 0.9, 0.06)), hm_screen, Vector3(-6.0, 1.55, -7.85), Vector3(-15, 0, 0))
-	_add_interact("terminal", _w(-6.0, -6.4), "Mission Control terminal", 2.0)
-	_add_mesh(hab_root, _box(Vector3(3.0, 1.6, 0.05)), hm_screen, Vector3(5.0, 1.8, -8.8))
-	# benches
-	for bx in [-6.0, 6.0]:
-		var bxf: float = bx
-		_pbox(Vector3(3.0, 0.45, 0.9), hm_dark, Vector3(bxf, 0.25, 7.8), true)
-		_add_mesh(hab_root, _box(Vector3(2.9, 0.12, 0.85)), _mat(Color(0.9, 0.42, 0.15), 0.0, 0.7), Vector3(bxf, 0.52, 7.8))
-	_plant_pot(Vector3(7.8, 0, -7.8))
-	_plant_pot(Vector3(7.8, 0, 4.0))
-	_plant_pot(Vector3(-7.8, 0, 4.0))
-	# airlock porch outside
-	_sign("BASE ALPHA  •  GALE OUTPOST", Vector3(0, 3.9, 9.25), 0.0)
-	for px in [-2.4, 2.4]:
-		var pxf: float = px
-		_add_mesh(hab_root, _cyl(0.12, 0.12, 3.0, 10), hm_trim, Vector3(pxf, 1.5, 11.6))
-		_add_circle(HAB_POS.x + pxf, HAB_POS.z + 11.6, 0.3)
-	_add_mesh(hab_root, _box(Vector3(5.4, 0.15, 3.0)), hm_hull, Vector3(0, 3.05, 10.6))
-	_add_mesh(hab_root, _box(Vector3(5.0, 0.05, 0.2)), hm_amber, Vector3(0, 2.96, 11.9))
-	var door_light := OmniLight3D.new()
-	door_light.light_color = Color(1.0, 0.75, 0.45)
-	door_light.light_energy = 2.4
-	door_light.omni_range = 12.0
-	door_light.position = Vector3(0, 2.7, 10.8)
-	hab_root.add_child(door_light)
-
-
-func _build_quarters_props() -> void:
-	var mattress := _mat(Color(0.25, 0.35, 0.6), 0.0, 0.9)
-	var pillow := _mat(Color(0.95, 0.95, 0.95), 0.0, 0.9)
-	var blanket := _mat(Color(0.9, 0.45, 0.2), 0.0, 0.9)
-	for i in 4:
-		var bx := -22.5 + float(i) * 3.2
-		var bz := 5.8
-		_pbox(Vector3(2.4, 0.45, 1.3), hm_trim, Vector3(bx, 0.25, bz), true)
-		_add_mesh(hab_root, _box(Vector3(2.3, 0.2, 1.2)), mattress, Vector3(bx, 0.57, bz))
-		_add_mesh(hab_root, _box(Vector3(1.4, 0.06, 1.22)), blanket, Vector3(bx + 0.4, 0.69, bz))
-		_add_mesh(hab_root, _box(Vector3(0.5, 0.15, 0.8)), pillow, Vector3(bx - 0.85, 0.74, bz))
-		for cx in [-1.15, 1.15]:
-			for cz in [-0.6, 0.6]:
-				var cxf: float = cx
-				var czf: float = cz
-				_add_mesh(hab_root, _cyl(0.05, 0.05, 2.1, 6), hm_trim, Vector3(bx + cxf, 1.05, bz + czf))
-		_add_mesh(hab_root, _box(Vector3(2.4, 0.15, 1.3)), hm_trim, Vector3(bx, 1.55, bz))
-		_add_mesh(hab_root, _box(Vector3(2.3, 0.18, 1.2)), mattress, Vector3(bx, 1.72, bz))
-		_add_interact("bunk", _w(bx, 4.5), "Sleep in bunk", 1.7)
-	# lockers
-	var locker := _mat(Color(0.45, 0.5, 0.58), 0.6, 0.35)
-	for i in 5:
-		var lz := -5.6 + float(i) * 0.95
-		_pbox(Vector3(0.7, 2.1, 0.9), locker, Vector3(-24.4, 1.05, lz))
-		var hmat: StandardMaterial3D = hm_amber if i == 2 else hm_glow
-		_add_mesh(hab_root, _box(Vector3(0.05, 0.3, 0.06)), hmat, Vector3(-24.03, 1.1, lz + 0.3))
-	_add_rect_local(-24.4, -3.7, 0.7, 4.8)
-	_add_interact("locker", _w(-23.3, -3.7), "Open your locker (customise)", 2.0)
-	# desk
-	_pbox(Vector3(2.6, 0.08, 1.1), hm_wood, Vector3(-12.0, 0.85, -5.9), true)
-	for lx in [-1.2, 1.2]:
-		var lxf: float = lx
-		_add_mesh(hab_root, _box(Vector3(0.08, 0.85, 1.0)), hm_trim, Vector3(-12.0 + lxf, 0.42, -5.9))
-	_add_mesh(hab_root, _box(Vector3(1.1, 0.65, 0.05)), hm_screen, Vector3(-12.0, 1.3, -6.3))
-	_add_mesh(hab_root, _box(Vector3(0.6, 0.08, 0.6)), hm_dark, Vector3(-12.0, 0.5, -4.8))
-	_add_mesh(hab_root, _sph(0.12, 10, 6), hm_amber, Vector3(-13.0, 1.25, -6.1))
-	# rug, shelf, window
-	_add_mesh(hab_root, _box(Vector3(5.0, 0.02, 3.4)), _mat(Color(0.55, 0.22, 0.18), 0.0, 1.0), Vector3(-17.0, 0.11, 0.5))
-	_pbox(Vector3(0.5, 1.8, 2.0), hm_wood, Vector3(-24.5, 0.9, 2.2), true)
-	for i in 8:
-		var bc := Color.from_hsv(rng.randf(), 0.6, 0.8)
-		_add_mesh(hab_root, _box(Vector3(0.3, 0.38, 0.12)), _mat(bc, 0.0, 0.8), Vector3(-24.35, 0.6 + float(i / 4) * 0.6, 1.5 + float(i % 4) * 0.4))
-	_add_mesh(hab_root, _box(Vector3(0.05, 1.2, 2.6)), _mat(Color(0.9, 0.55, 0.35), 0.0, 0.2, Color(1.0, 0.55, 0.3), 0.9), Vector3(-24.8, 1.8, -0.3))
-
-
-func _build_galley_props() -> void:
-	var counter := _mat(Color(0.75, 0.76, 0.8), 0.5, 0.3)
-	_pbox(Vector3(1.2, 1.0, 7.5), hm_trim, Vector3(24.1, 0.5, -1.25), true)
-	_add_mesh(hab_root, _box(Vector3(1.3, 0.08, 7.6)), counter, Vector3(24.1, 1.04, -1.25))
-	_add_mesh(hab_root, _box(Vector3(0.9, 1.1, 1.2)), hm_hull, Vector3(24.1, 1.63, -3.5))
-	_add_mesh(hab_root, _box(Vector3(0.05, 0.4, 0.6)), _mat(Color(0.2, 1.0, 0.4), 0.0, 0.3, Color(0.2, 1.0, 0.4), 2.0), Vector3(23.63, 1.75, -3.5))
-	_add_interact("dispenser", _w(22.8, -3.5), "Food dispenser (Ration Pack)", 1.8)
-	_add_mesh(hab_root, _box(Vector3(0.5, 0.6, 0.5)), hm_dark, Vector3(24.1, 1.38, 0.5))
-	_add_mesh(hab_root, _cyl(0.08, 0.07, 0.15, 10), pillow_mat(), Vector3(23.8, 1.16, 0.5))
-	_add_interact("coffee", _w(22.8, 0.5), "Coffee machine (+Rest)", 1.6)
-	_add_mesh(hab_root, _box(Vector3(0.8, 0.1, 0.9)), hm_dark, Vector3(24.1, 1.05, -1.5))
-	_add_mesh(hab_root, _cyl(0.03, 0.03, 0.4, 6), counter, Vector3(24.35, 1.25, -1.5))
-	_pbox(Vector3(1.3, 2.3, 1.4), counter, Vector3(24.0, 1.15, 4.6), true)
-	_add_mesh(hab_root, _box(Vector3(0.05, 0.9, 0.06)), hm_glow, Vector3(23.33, 1.4, 4.1))
-	_add_interact("fridge", _w(22.7, 4.6), "Fridge (fresh food)", 1.8)
-	_add_mesh(hab_root, _cyl(1.5, 1.5, 0.1, 32), hm_wood, Vector3(15, 0.9, 0))
-	_add_mesh(hab_root, _cyl(0.15, 0.4, 0.85, 12), hm_trim, Vector3(15, 0.43, 0))
-	for i in 4:
-		var a := TAU * float(i) / 4.0 + 0.4
-		_add_mesh(hab_root, _box(Vector3(0.55, 0.5, 0.55)), _mat(Color(0.9, 0.42, 0.15), 0.0, 0.7), Vector3(15 + cos(a) * 2.0, 0.25, sin(a) * 2.0))
-	_add_circle(HAB_POS.x + 15.0, HAB_POS.z, 2.2)
-	_add_mesh(hab_root, _cyl(0.01, 0.01, 0.6, 4), hm_trim, Vector3(15, 2.9, 0))
-	_add_mesh(hab_root, _sph(0.3, 16, 8, true), hm_amber, Vector3(15, 2.45, 0), Vector3(180, 0, 0))
-	_add_mesh(hab_root, _box(Vector3(2.4, 1.2, 0.05)), hm_screen, Vector3(16.0, 1.9, 6.78))
-	_plant_pot(Vector3(10.6, 0, -5.6))
-
-
-func pillow_mat() -> StandardMaterial3D:
-	return _mat(Color(0.95, 0.95, 0.95), 0.0, 0.6)
-
-
-func _build_greenhouse_props() -> void:
-	var planter := _mat(Color(0.85, 0.85, 0.88), 0.3, 0.5)
-	var soil := _mat(Color(0.22, 0.14, 0.09), 0.0, 1.0)
-	var stem := _mat(Color(0.25, 0.5, 0.2), 0.0, 0.8)
-	var leaf := _mat(Color(0.3, 0.75, 0.3), 0.0, 0.7)
-	var fruit := _mat(Color(0.95, 0.25, 0.15), 0.0, 0.4)
-	var grow := _mat(Color(1.0, 0.3, 0.9), 0.0, 0.3, Color(1.0, 0.3, 0.9), 3.0)
-	for col in [-4.5, 4.5]:
-		var cx: float = col
-		_add_mesh(hab_root, _box(Vector3(0.3, 0.08, 15.0)), grow, Vector3(cx, 2.75, -18.3))
-		for row in 4:
-			var pz := -12.5 - float(row) * 3.9
-			_pbox(Vector3(2.6, 0.7, 2.8), planter, Vector3(cx, 0.35, pz), true)
-			_add_mesh(hab_root, _box(Vector3(2.4, 0.05, 2.6)), soil, Vector3(cx, 0.72, pz))
-			var pr := Node3D.new()
-			pr.position = Vector3(cx, 0.72, pz)
-			hab_root.add_child(pr)
-			for k in 6:
-				var ox := rng.randf_range(-0.9, 0.9)
-				var oz := rng.randf_range(-1.0, 1.0)
-				_add_mesh(pr, _cyl(0.03, 0.04, 0.5, 5), stem, Vector3(ox, 0.25, oz))
-				_add_mesh(pr, _sph(0.28, 8, 5), leaf, Vector3(ox, 0.55, oz)).scale = Vector3(1, 0.7, 1)
-				if k % 3 == 0:
-					_add_mesh(pr, _sph(0.09, 8, 4), fruit, Vector3(ox + 0.15, 0.5, oz))
-			_add_interact("plant", _w(signf(cx) * 2.5, pz), "Harvest Fresh Greens", 1.9, {"grow": rng.randf_range(0.6, 1.0), "plant_node": pr})
-	for tx in [-6.9, 6.9]:
-		var txf: float = tx
-		_add_mesh(hab_root, _cyl(0.6, 0.6, 2.2, 16), _glass(Color(0.3, 0.6, 1.0, 0.55)), Vector3(txf, 1.1, -10.6))
-		_add_circle(HAB_POS.x + txf, HAB_POS.z - 10.6, 0.7)
-	_sign("GREENHOUSE", Vector3(0, 2.75, -8.8), 0.0, 40, Color(0.2, 0.6, 0.25))
-
-
-func _build_workshop_props() -> void:
-	_pbox(Vector3(3.4, 2.2, 1.6), hm_trim, Vector3(17.0, 1.1, -21.9), true)
-	_add_mesh(hab_root, _box(Vector3(2.0, 0.9, 0.05)), _mat(Color(1.0, 0.5, 0.15), 0.0, 0.2, Color(1.0, 0.5, 0.15), 2.6), Vector3(17.0, 1.3, -21.08))
-	_add_mesh(hab_root, _box(Vector3(3.6, 0.2, 1.8)), hm_amber, Vector3(17.0, 2.3, -21.9))
-	for i in 6:
-		var m: StandardMaterial3D = _mat(Color(1.0, 0.85, 0.1), 0.0, 0.6) if i % 2 == 0 else hm_dark
-		_add_mesh(hab_root, _box(Vector3(0.6, 0.02, 1.0)), m, Vector3(15.5 + float(i) * 0.6, 0.11, -20.4))
-	_add_interact("fabricator", _w(17.0, -20.0), "Fabricator (craft)", 2.2)
-	_pbox(Vector3(1.2, 0.95, 4.5), hm_wood, Vector3(24.0, 0.48, -15.0), true)
-	for i in 5:
-		_add_mesh(hab_root, _box(Vector3(0.3, 0.15, 0.5)), _mat(Color.from_hsv(0.05 * float(i), 0.7, 0.8), 0.6, 0.4), Vector3(24.0, 1.03, -16.8 + float(i) * 0.8))
-	_add_mesh(hab_root, _box(Vector3(0.05, 1.4, 3.0)), hm_dark, Vector3(9.22, 1.6, -15.0))
-	for i in 6:
-		_add_mesh(hab_root, _box(Vector3(0.06, 0.5, 0.1)), hm_trim, Vector3(9.3, 1.6, -16.2 + float(i) * 0.5))
-	_pbox(Vector3(1.4, 1.6, 1.4), _glass(Color(0.6, 0.9, 1.0, 0.3)), Vector3(11.5, 0.8, -20.5), true)
-	_add_mesh(hab_root, _box(Vector3(0.5, 0.5, 0.5)), hm_glow, Vector3(11.5, 0.6, -20.5))
-	for i in 3:
-		_add_mesh(hab_root, _cyl(0.5, 0.5, 0.45, 18), _mat(Color(0.09, 0.09, 0.1), 0.0, 0.9), Vector3(22.5, 0.25 + float(i) * 0.46, -9.2))
-	_add_circle(HAB_POS.x + 22.5, HAB_POS.z - 9.2, 0.6)
-	_sign("WORKSHOP", Vector3(17.0, 2.75, -7.2), 180.0, 40)
-
-
-func _build_storage_props() -> void:
-	for sx in [-22.0, -17.5, -13.0]:
-		var sxf: float = sx
-		_pbox(Vector3(3.6, 0.08, 1.0), hm_trim, Vector3(sxf, 0.9, -22.3), true)
-		_add_mesh(hab_root, _box(Vector3(3.6, 0.08, 1.0)), hm_trim, Vector3(sxf, 1.8, -22.3))
-		for k in 4:
-			var cc := Color(0.75, 0.6, 0.35) if k % 2 == 0 else Color(0.4, 0.45, 0.5)
-			_add_mesh(hab_root, _box(Vector3(0.7, 0.6, 0.7)), _mat(cc, 0.2, 0.7), Vector3(sxf - 1.2 + float(k) * 0.8, 1.25 + float(k % 2) * 0.9, -22.3))
-	for i in 5:
-		_pbox(Vector3(1.1, 1.0, 1.1), _mat(Color(0.75, 0.6, 0.35), 0.1, 0.8), Vector3(-11.0 - float(i % 2) * 1.3, 0.5 + float(i / 2) * 1.0 * 0.0, -10.0 - float(i) * 1.2), i < 3)
-	_pbox(Vector3(0.5, 2.0, 2.4), hm_trim, Vector3(-9.7, 1.0, -15.0), true)
-	for i in 3:
-		_add_mesh(hab_root, _cyl(0.08, 0.12, 1.1, 10), hm_hull, Vector3(-10.05, 1.1, -15.8 + float(i) * 0.8))
-		_add_mesh(hab_root, _sph(0.1, 8, 4), hm_amber, Vector3(-10.05, 0.5, -15.8 + float(i) * 0.8))
-	_add_interact("drill_rack", _w(-10.9, -15.0), "Drill upgrade rack", 1.9)
-	for i in 3:
-		_add_mesh(hab_root, _cyl(0.4, 0.4, 1.0, 14), _mat(Color(0.85, 0.3, 0.12), 0.4, 0.5), Vector3(-23.6, 0.5, -9.0 - float(i) * 0.9))
-	_add_rect_local(-23.6, -9.9, 0.9, 2.8)
-	drone = Node3D.new()
-	drone.position = Vector3(-17.0, 2.0, -15.0)
-	hab_root.add_child(drone)
-	_add_mesh(drone, _box(Vector3(0.6, 0.18, 0.6)), hm_hull)
-	for i in 4:
-		var a := TAU * float(i) / 4.0 + PI / 4.0
-		_add_mesh(drone, _cyl(0.22, 0.22, 0.03, 12), hm_trim, Vector3(cos(a) * 0.45, 0.1, sin(a) * 0.45))
-	_add_mesh(drone, _sph(0.06, 8, 4), hm_glow, Vector3(0, -0.1, -0.3))
-	_sign("STORAGE BAY", Vector3(-25.2, 3.0, -15.0), -90.0, 40)
-
-
-# ───────────────────────────── OUTDOOR PROPS ────────────────────────────────
-func _build_outdoor() -> void:
-	var trim := hm_trim
-	var amber := hm_amber
-	# landing pad
-	var pad := Node3D.new()
-	pad.position = PAD_POS
-	surface_root.add_child(pad)
-	_add_mesh(pad, _cyl(8.0, 8.2, 0.14, 48), _mat(Color(0.5, 0.45, 0.42), 0.1, 0.85), Vector3(0, 0.07, 0))
-	_add_mesh(pad, _cyl(7.4, 7.4, 0.16, 48), _mat(Color(0.32, 0.30, 0.30), 0.2, 0.8), Vector3(0, 0.08, 0))
-	_add_mesh(pad, _box(Vector3(0.5, 0.18, 5.0)), amber, Vector3(-1.8, 0.09, 0))
-	_add_mesh(pad, _box(Vector3(0.5, 0.18, 5.0)), amber, Vector3(1.8, 0.09, 0))
-	_add_mesh(pad, _box(Vector3(3.1, 0.18, 0.5)), amber, Vector3(0, 0.09, 0))
-	pad_light_mat = _mat(Color(1.0, 0.3, 0.1), 0.0, 0.3, Color(1.0, 0.3, 0.1), 3.0)
-	for i in 16:
-		var a := TAU * float(i) / 16.0
-		_add_mesh(pad, _sph(0.14, 8, 4), pad_light_mat, Vector3(cos(a) * 7.8, 0.2, sin(a) * 7.8))
-	_add_circle(PAD_POS.x, PAD_POS.z, 2.2)   # capsule footprint
-	# path lights pad -> airlock
-	var z := 6.0
-	while z > -10.0:
-		for px in [-2.4, 2.4]:
-			var pxf: float = px
-			_add_mesh(surface_root, _cyl(0.06, 0.08, 0.6, 8), trim, Vector3(pxf, 0.3, z))
-			_add_mesh(surface_root, _sph(0.09, 8, 4), hm_glow, Vector3(pxf, 0.65, z))
-		z -= 3.0
-	# solar farm
-	var panel_mat := _mat(Color(0.08, 0.16, 0.42), 0.7, 0.2, Color(0.1, 0.3, 0.9), 0.25)
-	for c in 3:
-		for r in 4:
-			var px := 36.0 + float(c) * 8.0
-			var pz := -16.0 - float(r) * 7.0
-			_add_mesh(surface_root, _box(Vector3(6.0, 0.12, 3.4)), panel_mat, Vector3(px, 1.9, pz), Vector3(-30, 0, 0))
-			_add_mesh(surface_root, _box(Vector3(6.1, 0.05, 0.08)), trim, Vector3(px, 2.75, pz - 1.45), Vector3(-30, 0, 0))
-			_add_mesh(surface_root, _cyl(0.1, 0.12, 1.8, 8), trim, Vector3(px, 0.9, pz))
-			_add_circle(px, pz, 2.6)
-	# fuel / water tanks
-	for i in 4:
-		var tx := -12.0 + float(i) * 8.0
-		_add_mesh(surface_root, _cyl(1.6, 1.6, 4.0, 24), hm_hull, Vector3(tx, 2.0, -52.0))
-		_add_mesh(surface_root, _sph(1.6, 24, 8, true), hm_hull, Vector3(tx, 4.0, -52.0))
-		_add_mesh(surface_root, _cyl(1.65, 1.65, 0.3, 24), _mat(Color(0.9, 0.45, 0.15), 0.2, 0.5), Vector3(tx, 2.6, -52.0))
-		_add_circle(tx, -52.0, 1.9)
-	# antenna tower with blinking beacon
-	var tower := Vector3(-34.0, 0.0, -6.0)
-	for i in 4:
-		var a := TAU * float(i) / 4.0 + PI / 4.0
-		_line_mesh(surface_root, tower + Vector3(cos(a) * 1.4, 0, sin(a) * 1.4), tower + Vector3(cos(a) * 0.3, 14.0, sin(a) * 0.3), 0.07, trim)
-	for h in 5:
-		_add_mesh(surface_root, _cyl(1.3 - float(h) * 0.22, 1.3 - float(h) * 0.22, 0.06, 8), trim, tower + Vector3(0, 2.5 + float(h) * 2.6, 0))
-	_add_mesh(surface_root, _sph(1.3, 20, 8, true), hm_hull, tower + Vector3(0, 13.0, 0.6), Vector3(120, 0, 0))
-	hab_beacon_mat = _mat(Color(1.0, 0.1, 0.1), 0.0, 0.3, Color(1.0, 0.1, 0.1), 2.0)
-	_add_mesh(surface_root, _sph(0.2, 10, 6), hab_beacon_mat, tower + Vector3(0, 14.3, 0))
-	_add_circle(tower.x, tower.z, 1.8)
-	# comms dish
-	var dish := Vector3(30.0, 0.0, -4.0)
-	_add_mesh(surface_root, _cyl(0.4, 0.6, 3.0, 12), trim, dish + Vector3(0, 1.5, 0))
-	var dish_mat := hm_hull.duplicate() as StandardMaterial3D
-	dish_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
-	_add_mesh(surface_root, _sph(2.6, 28, 10, true), dish_mat, dish + Vector3(0, 3.6, 0), Vector3(140, 30, 0))
-	_add_circle(dish.x, dish.z, 1.0)
-	# oxygen generator with spinning fans
-	var o2 := Vector3(-16.0, 0.0, -6.0)
-	_add_mesh(surface_root, _box(Vector3(3.2, 2.0, 2.2)), hm_hull, o2 + Vector3(0, 1.0, 0))
-	_add_mesh(surface_root, _box(Vector3(3.25, 0.15, 2.25)), hm_glow, o2 + Vector3(0, 1.6, 0))
-	for fx in [-0.8, 0.8]:
-		var fxf: float = fx
-		var fan := Node3D.new()
-		fan.position = o2 + Vector3(fxf, 2.05, 0)
-		surface_root.add_child(fan)
-		_add_mesh(fan, _box(Vector3(1.2, 0.05, 0.18)), trim)
-		_add_mesh(fan, _box(Vector3(0.18, 0.05, 1.2)), trim)
-		o2_fans.append(fan)
-	_add_rect_world(o2.x, o2.z, 3.2, 2.2)
-	# flags & rover bay
-	var flag_mat := _mat(Color(0.95, 0.42, 0.12), 0.0, 0.7)
-	for fx in [-6.5, 6.5]:
-		var fxf: float = fx
-		_add_mesh(surface_root, _cyl(0.05, 0.05, 4.0, 8), trim, Vector3(fxf, 2.0, 5.0))
-		_add_mesh(surface_root, _box(Vector3(1.4, 0.8, 0.03)), flag_mat, Vector3(fxf + 0.72, 3.5, 5.0))
-		_add_circle(fxf, 5.0, 0.2)
-	_add_mesh(surface_root, _box(Vector3(5.0, 0.06, 6.0)), _mat(Color(0.3, 0.29, 0.29), 0.2, 0.8), Vector3(ROVER_START.x, 0.03, ROVER_START.z))
-	_add_mesh(surface_root, _box(Vector3(5.1, 0.08, 0.15)), amber, Vector3(ROVER_START.x, 0.04, ROVER_START.z + 3.0))
-	_add_mesh(surface_root, _box(Vector3(5.1, 0.08, 0.15)), amber, Vector3(ROVER_START.x, 0.04, ROVER_START.z - 3.0))
-
-
-# ───────────────────────────── DROP CAPSULE ─────────────────────────────────
-func _build_capsule() -> void:
-	capsule = Node3D.new()
-	capsule.name = "Ares7Capsule"
-	capsule.position = PAD_POS
-	surface_root.add_child(capsule)
-	var hull := _mat(Color(0.92, 0.92, 0.94), 0.3, 0.45)
-	var shield := _mat(Color(0.32, 0.22, 0.16), 0.2, 0.9)
-	var stripe := _mat(Color(0.95, 0.42, 0.12), 0.2, 0.5)
-	var win := _mat(Color(0.1, 0.2, 0.3), 0.8, 0.1, Color(0.3, 0.7, 1.0), 0.8)
-	_add_mesh(capsule, _cyl(2.0, 2.0, 0.35, 32), shield, Vector3(0, 0.38, 0))
-	_add_mesh(capsule, _cyl(0.95, 1.9, 2.6, 32), hull, Vector3(0, 1.85, 0))
-	_add_mesh(capsule, _cyl(1.86, 1.93, 0.22, 32), stripe, Vector3(0, 0.72, 0))
-	_add_mesh(capsule, _cyl(0.6, 0.95, 0.45, 24), hm_dark, Vector3(0, 3.37, 0))
-	_add_mesh(capsule, _cyl(0.45, 0.45, 0.25, 16), hull, Vector3(0, 3.72, 0))
-	for a in [1.2, -1.2, PI]:
-		var af: float = a
-		_add_mesh(capsule, _box(Vector3(0.45, 0.35, 0.06)), win, Vector3(sin(af) * 1.36, 2.4, -cos(af) * 1.36), Vector3(20, rad_to_deg(-af), 0))
-	for i in 4:
-		var a := TAU * float(i) / 4.0 + PI / 4.0
-		_line_mesh(capsule, Vector3(cos(a) * 1.5, 1.0, sin(a) * 1.5), Vector3(cos(a) * 2.6, 0.08, sin(a) * 2.6), 0.07, hm_trim)
-		_add_mesh(capsule, _cyl(0.3, 0.35, 0.08, 12), hm_trim, Vector3(cos(a) * 2.6, 0.04, sin(a) * 2.6))
-	var lab := Label3D.new()
-	lab.text = "ARES-7"
-	lab.font_size = 96
-	lab.pixel_size = 0.006
-	lab.modulate = Color(0.1, 0.1, 0.15)
-	lab.outline_size = 0
-	lab.position = Vector3(1.55, 1.9, 0)
-	lab.rotation_degrees = Vector3(0, 90, 20)
-	capsule.add_child(lab)
-	# hatch (faces -Z, toward the base)
-	_add_mesh(capsule, _box(Vector3(1.15, 1.35, 0.05)), hm_dark, Vector3(0, 1.45, -1.55), Vector3(20, 0, 0))
-	hatch_hinge = Node3D.new()
-	hatch_hinge.position = Vector3(-0.58, 1.45, -1.63)
-	capsule.add_child(hatch_hinge)
-	var tilt := Node3D.new()
-	tilt.rotation_degrees = Vector3(20, 0, 0)
-	hatch_hinge.add_child(tilt)
-	_add_mesh(tilt, _box(Vector3(1.1, 1.3, 0.1)), hull, Vector3(0.55, 0, 0))
-	_add_mesh(tilt, _cyl(0.18, 0.18, 0.12, 16), win, Vector3(0.55, 0.25, 0), Vector3(90, 0, 0))
-	# re-entry glow, trail, retro flame
-	capsule_glow = _add_mesh(capsule, _sph(2.4, 24, 12), _additive(Color(1.0, 0.45, 0.15, 0.55)), Vector3(0, 0.2, 0))
-	capsule_glow.scale = Vector3(1.0, 0.55, 1.0)
-	capsule_trail = _make_particles(90, 1.6, Color(1.0, 0.55, 0.2, 0.8), 1.5, 3.0, true)
-	capsule_trail.direction = Vector3.UP
-	capsule_trail.spread = 15.0
-	capsule_trail.gravity = Vector3.ZERO
-	capsule_trail.initial_velocity_min = 2.0
-	capsule_trail.initial_velocity_max = 6.0
-	capsule.add_child(capsule_trail)
-	capsule_flame = _make_particles(70, 0.45, Color(1.0, 0.6, 0.25, 0.9), 0.5, 1.2, true)
-	capsule_flame.direction = Vector3.DOWN
-	capsule_flame.spread = 25.0
-	capsule_flame.gravity = Vector3.ZERO
-	capsule_flame.initial_velocity_min = 10.0
-	capsule_flame.initial_velocity_max = 16.0
-	capsule_flame.position = Vector3(0, 0.15, 0)
-	capsule.add_child(capsule_flame)
-	capsule_light = OmniLight3D.new()
-	capsule_light.light_color = Color(1.0, 0.6, 0.3)
-	capsule_light.omni_range = 20.0
-	capsule_light.position = Vector3(0, -0.5, 0)
-	capsule_light.visible = false
-	capsule.add_child(capsule_light)
-	# parachute (separate node so it can detach and drift away)
-	chute = Node3D.new()
-	surface_root.add_child(chute)
-	var cm := _mat(Color(0.95, 0.45, 0.15), 0.0, 0.7)
-	cm.cull_mode = BaseMaterial3D.CULL_DISABLED
-	_add_mesh(chute, _sph(6.0, 24, 8, true), cm)
-	var band := TorusMesh.new()
-	band.inner_radius = 5.8
-	band.outer_radius = 6.1
-	_add_mesh(chute, band, _mat(Color.WHITE, 0.0, 0.7))
-	var line_mat := _mat(Color(0.9, 0.9, 0.9), 0.0, 0.8)
-	for i in 8:
-		var a := TAU * float(i) / 8.0
-		_line_mesh(chute, Vector3(cos(a) * 5.9, 0, sin(a) * 5.9), Vector3(0, -10.3, 0), 0.03, line_mat)
-	chute.visible = false
-	landing_dust = _make_particles(140, 2.5, Color(0.8, 0.56, 0.38, 0.55), 3.0, 6.0)
-	landing_dust.one_shot = true
-	landing_dust.explosiveness = 0.95
-	landing_dust.direction = Vector3(1, 0, 0)
-	landing_dust.spread = 180.0
-	landing_dust.flatness = 0.92
-	landing_dust.initial_velocity_min = 9.0
-	landing_dust.initial_velocity_max = 18.0
-	landing_dust.damping_min = 6.0
-	landing_dust.damping_max = 9.0
-	landing_dust.gravity = Vector3(0, 0.3, 0)
-	landing_dust.position = PAD_POS + Vector3(0, 0.4, 0)
-	surface_root.add_child(landing_dust)
-
-
-# ───────────────────────────── ASTRONAUT ────────────────────────────────────
-func _make_limb(parent: Node3D, pivot_pos: Vector3, radius: float, length: float, mat: Material, end_mat: Material, end_r: float) -> Node3D:
-	var pivot := Node3D.new()
-	pivot.position = pivot_pos
-	parent.add_child(pivot)
-	_add_mesh(pivot, _cap(radius, length), mat, Vector3(0, -length * 0.5, 0))
-	_add_mesh(pivot, _sph(end_r, 12, 6), end_mat, Vector3(0, -length, 0))
-	return pivot
-
-
-func _build_astronaut() -> void:
-	astro = Node3D.new()
-	astro.name = "Astronaut"
-	surface_root.add_child(astro)
-	astro_model = Node3D.new()
-	astro.add_child(astro_model)
-	suit_mat = _mat(Color(0.93, 0.93, 0.95), 0.1, 0.55)
-	var dark := _mat(Color(0.20, 0.20, 0.24), 0.3, 0.6)
-	visor_mat = _mat(Color(1.0, 0.78, 0.25), 1.0, 0.06, Color(0.9, 0.6, 0.1), 0.35)
-	var pack := _mat(Color(0.62, 0.63, 0.68), 0.3, 0.6)
-	accent_mat = _mat(Color(1.0, 0.4, 0.15), 0.0, 0.5, Color(1.0, 0.4, 0.15), 0.6)
-	_add_mesh(astro_model, _cap(0.32, 1.3), suit_mat, Vector3(0, 0.15, 0))
-	_add_mesh(astro_model, _sph(0.31, 24, 12), suit_mat, Vector3(0, 1.02, 0))
-	_add_mesh(astro_model, _sph(0.24, 24, 12), visor_mat, Vector3(0, 1.03, -0.13)).scale = Vector3(1.0, 0.82, 0.7)
-	_add_mesh(astro_model, _box(Vector3(0.5, 0.7, 0.26)), pack, Vector3(0, 0.3, 0.33))
-	_add_mesh(astro_model, _box(Vector3(0.52, 0.08, 0.28)), accent_mat, Vector3(0, 0.55, 0.33))
-	_add_mesh(astro_model, _box(Vector3(0.22, 0.14, 0.05)), accent_mat, Vector3(0, 0.5, -0.32))
-	_add_mesh(astro_model, _cyl(0.325, 0.325, 0.1, 20), dark, Vector3(0, -0.05, 0))
-	_add_mesh(astro_model, _cyl(0.33, 0.33, 0.06, 20), accent_mat, Vector3(0, 0.78, 0))
-	arm_l = _make_limb(astro_model, Vector3(-0.42, 0.62, 0), 0.1, 0.55, suit_mat, dark, 0.11)
-	arm_r = _make_limb(astro_model, Vector3(0.42, 0.62, 0), 0.1, 0.55, suit_mat, dark, 0.11)
-	leg_l = _make_limb(astro_model, Vector3(-0.16, 0.0, 0), 0.13, 0.38, suit_mat, dark, 0.12)
-	leg_r = _make_limb(astro_model, Vector3(0.16, 0.0, 0), 0.13, 0.38, suit_mat, dark, 0.12)
-	helmet_light = SpotLight3D.new()
-	helmet_light.position = Vector3(0, 1.2, -0.3)
-	helmet_light.spot_range = 18.0
-	helmet_light.spot_angle = 28.0
-	helmet_light.light_energy = 2.5
-	helmet_light.visible = false
-	astro_model.add_child(helmet_light)
-	callsign_label = Label3D.new()
-	callsign_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-	callsign_label.font_size = 40
-	callsign_label.pixel_size = 0.006
-	callsign_label.outline_size = 10
-	callsign_label.modulate = Color(1.0, 0.85, 0.6)
-	callsign_label.position = Vector3(0, 1.75, 0)
-	astro.add_child(callsign_label)
-	step_dust = _make_particles(24, 0.9, Color(0.75, 0.52, 0.36, 0.5), 0.25, 0.6)
-	step_dust.direction = Vector3.UP
-	step_dust.spread = 60.0
-	step_dust.initial_velocity_min = 0.5
-	step_dust.initial_velocity_max = 1.2
-	step_dust.gravity = Vector3(0, -0.6, 0)
-	step_dust.position = Vector3(0, -0.45, 0)
-	astro.add_child(step_dust)
-
-
-# ───────────────────────────── ROVER ────────────────────────────────────────
-func _build_rover() -> void:
-	rover = Node3D.new()
-	rover.name = "AresScoutRover"
-	rover.position = ROVER_START
-	rover.rotation.y = rover_heading
-	surface_root.add_child(rover)
-	var body := _mat(Color(0.92, 0.90, 0.86), 0.25, 0.5)
-	rover_paint_mat = _mat(Color(0.95, 0.42, 0.12), 0.3, 0.4)
-	var dark := _mat(Color(0.12, 0.12, 0.14), 0.4, 0.7)
-	var tire := _mat(Color(0.09, 0.09, 0.10), 0.0, 0.9)
-	var glass := _mat(Color(0.15, 0.20, 0.28), 0.8, 0.1)
-	var panel_mat := _mat(Color(0.10, 0.20, 0.50), 0.6, 0.25, Color(0.1, 0.3, 0.9), 0.25)
-	var lamp := _mat(Color(1.0, 1.0, 0.85), 0.0, 0.2, Color(1.0, 0.95, 0.8), 3.0)
-	_add_mesh(rover, _box(Vector3(2.0, 0.45, 3.8)), body, Vector3(0, 0.55, 0))
-	_add_mesh(rover, _box(Vector3(2.04, 0.2, 3.7)), dark, Vector3(0, 0.35, 0))
-	_add_mesh(rover, _box(Vector3(2.02, 0.14, 3.0)), rover_paint_mat, Vector3(0, 0.62, 0.2))
-	_add_mesh(rover, _box(Vector3(1.6, 0.7, 1.6)), body, Vector3(0, 1.1, 0.3))
-	_add_mesh(rover, _box(Vector3(1.62, 0.12, 1.62)), rover_paint_mat, Vector3(0, 1.4, 0.3))
-	_add_mesh(rover, _box(Vector3(1.5, 0.4, 0.05)), glass, Vector3(0, 1.2, -0.52))
-	_add_mesh(rover, _box(Vector3(1.9, 0.05, 1.2)), panel_mat, Vector3(0, 1.58, 0.65), Vector3(-8, 0, 0))
-	_add_mesh(rover, _cyl(0.04, 0.04, 1.0, 8), dark, Vector3(0.55, 1.95, -0.3))
-	_add_mesh(rover, _box(Vector3(0.3, 0.18, 0.22)), dark, Vector3(0.55, 2.5, -0.3))
-	_add_mesh(rover, _box(Vector3(0.1, 0.1, 0.05)), lamp, Vector3(0.55, 2.5, -0.42))
-	_add_mesh(rover, _sph(0.35, 16, 6, true), body, Vector3(-0.6, 1.5, -0.1), Vector3(150, 0, 0))
-	_add_mesh(rover, _box(Vector3(2.0, 0.25, 0.2)), dark, Vector3(0, 0.45, -1.95))
-	_add_mesh(rover, _box(Vector3(0.3, 0.14, 0.05)), lamp, Vector3(0.7, 0.62, -1.92))
-	_add_mesh(rover, _box(Vector3(0.3, 0.14, 0.05)), lamp, Vector3(-0.7, 0.62, -1.92))
-	for side in [-1.0, 1.0]:
-		var sf: float = side
-		var lab := Label3D.new()
-		lab.text = "ARES"
-		lab.font_size = 96
-		lab.pixel_size = 0.0045
-		lab.modulate = Color(0.12, 0.12, 0.15)
-		lab.outline_size = 0
-		lab.position = Vector3(0.81 * sf, 1.1, 0.3)
-		lab.rotation_degrees = Vector3(0, 90.0 * sf, 0)
-		rover.add_child(lab)
-	for wz in [-1.4, 0.0, 1.4]:
-		for wx in [-1.2, 1.2]:
-			var pivot := Node3D.new()
-			pivot.position = Vector3(wx, 0.0, wz)
-			rover.add_child(pivot)
-			_add_mesh(pivot, _cyl(0.5, 0.5, 0.5, 20), tire, Vector3.ZERO, Vector3(0, 0, 90))
-			_add_mesh(pivot, _cyl(0.25, 0.25, 0.52, 12), rover_paint_mat, Vector3.ZERO, Vector3(0, 0, 90))
-			_add_mesh(pivot, _box(Vector3(0.54, 0.06, 0.9)), dark, Vector3.ZERO)
-			rover_wheels.append(pivot)
-	var head := SpotLight3D.new()
-	head.position = Vector3(0, 0.9, -2.0)
-	head.rotation_degrees = Vector3(-6, 0, 0)
-	head.spot_range = 30.0
-	head.spot_angle = 32.0
-	head.light_energy = 3.0
-	head.light_color = Color(1.0, 0.95, 0.85)
-	rover.add_child(head)
-	rover_dust = _make_particles(50, 1.6, Color(0.8, 0.55, 0.36, 0.45), 1.0, 2.6)
-	rover_dust.direction = Vector3(0, 0.5, 1)
-	rover_dust.spread = 30.0
-	rover_dust.initial_velocity_min = 1.5
-	rover_dust.initial_velocity_max = 3.5
-	rover_dust.gravity = Vector3(0, -0.4, 0)
-	rover_dust.position = Vector3(0, 0.1, 1.9)
-	rover.add_child(rover_dust)
-
-
-func _build_objective_marker() -> void:
-	objective_marker = Node3D.new()
-	surface_root.add_child(objective_marker)
-	objective_label = Label3D.new()
-	objective_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-	objective_label.no_depth_test = true
-	objective_label.fixed_size = true
-	objective_label.pixel_size = 0.0018
-	objective_label.font_size = 56
-	objective_label.outline_size = 14
-	objective_label.modulate = Color(1.0, 0.82, 0.3)
-	objective_label.render_priority = 10
-	objective_marker.add_child(objective_label)
-	objective_marker.visible = false
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  COLLISION (flat world: circles + axis-aligned boxes)
-# ═══════════════════════════════════════════════════════════════════════════
-func _add_circle(x: float, z: float, r: float) -> void:
-	circles.append(Vector3(x, z, r))
-
-
-func _add_rect_world(cx: float, cz: float, sx: float, sz: float) -> void:
-	rects.append(Rect2(cx - sx * 0.5, cz - sz * 0.5, sx, sz))
-
-
-func _add_rect_local(cx: float, cz: float, sx: float, sz: float) -> void:
-	_add_rect_world(HAB_POS.x + cx, HAB_POS.z + cz, sx, sz)
-
-
-func _dist_to_base(p: Vector3) -> float:
-	var cx := clampf(p.x, base_rect.position.x, base_rect.end.x)
-	var cz := clampf(p.z, base_rect.position.y, base_rect.end.y)
-	return Vector2(p.x - cx, p.z - cz).length()
-
-
-func _clear_of_structures(pos: Vector3, margin: float) -> bool:
-	if _dist_to_base(pos) < margin:
-		return false
-	if Vector2(pos.x - PAD_POS.x, pos.z - PAD_POS.z).length() < 9.0 + margin:
-		return false
-	if Vector2(pos.x - ROVER_START.x, pos.z - ROVER_START.z).length() < 4.0 + margin:
-		return false
-	for o in circles:
-		if Vector2(pos.x - o.x, pos.z - o.y).length() < o.z + margin:
-			return false
-	return true
-
-
-func _resolve_obstacles(p: Vector3, extra: float) -> Vector3:
-	for pass_i in 2:
-		for o in circles:
-			var d := Vector2(p.x - o.x, p.z - o.y)
-			var min_d := o.z + extra
-			var dist := d.length()
-			if dist < min_d:
-				var dir := Vector2(0.0, 1.0) if dist < 0.001 else d / dist
-				p.x = o.x + dir.x * min_d
-				p.z = o.y + dir.y * min_d
-		for rc in rects:
-			var cx := clampf(p.x, rc.position.x, rc.end.x)
-			var cz := clampf(p.z, rc.position.y, rc.end.y)
-			var dx := p.x - cx
-			var dz := p.z - cz
-			var d2 := dx * dx + dz * dz
-			if d2 > extra * extra:
-				continue
-			if d2 > 0.000001:
-				var dd := sqrt(d2)
-				p.x = cx + dx / dd * extra
-				p.z = cz + dz / dd * extra
-			else:
-				var l := p.x - rc.position.x
-				var r := rc.end.x - p.x
-				var t := p.z - rc.position.y
-				var b := rc.end.y - p.z
-				var m := minf(minf(l, r), minf(t, b))
-				if m == l:
-					p.x = rc.position.x - extra
-				elif m == r:
-					p.x = rc.end.x + extra
-				elif m == t:
-					p.z = rc.position.y - extra
-				else:
-					p.z = rc.end.y + extra
-	return p
-
-
-func _clamp_world(p: Vector3) -> Vector3:
-	var flat := Vector2(p.x, p.z)
-	if flat.length() > WORLD_LIMIT:
-		flat = flat.normalized() * WORLD_LIMIT
-		p.x = flat.x
-		p.z = flat.y
-	return p
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  INTERACTABLES, DEPOSITS, DROPS, GEMS
-# ═══════════════════════════════════════════════════════════════════════════
-func _add_interact(act: String, pos: Vector3, label: String, r := 2.2, extra := {}) -> Dictionary:
-	var d := {"act": act, "pos": pos, "label": label, "r": r, "hold": false, "cd": 0.0}
-	d.merge(extra, true)
-	interactables.append(d)
-	return d
-
-
-func _remove_interact(it: Dictionary) -> void:
-	for i in interactables.size():
-		if is_same(interactables[i], it):
-			interactables.remove_at(i)
-			break
-	if is_same(focus, it):
-		focus = {}
-
-
-func _clear_dynamic() -> void:
-	var i := interactables.size() - 1
-	while i >= 0:
-		var it: Dictionary = interactables[i]
-		if bool(it.get("dynamic", false)):
-			var n: Variant = it.get("node")
-			if n is Node and is_instance_valid(n):
-				(n as Node).queue_free()
-			interactables.remove_at(i)
-		i -= 1
-	focus = {}
-	for c in collectibles:
-		var gn: Node = c["node"]
-		if is_instance_valid(gn):
-			gn.queue_free()
-	collectibles.clear()
-
-
-func _spawn_deposit(pos: Vector3, kind := "") -> Dictionary:
-	if kind == "":
-		var r := rng.randf()
-		kind = "iron" if r < 0.5 else ("silica" if r < 0.75 else ("ice" if r < 0.93 else "titanium"))
-	var info: Dictionary = ITEMS[kind]
-	var col: Color = info["col"]
-	var root := Node3D.new()
-	root.position = Vector3(pos.x, 0.0, pos.z)
-	surface_root.add_child(root)
-	var anim := Node3D.new()
-	root.add_child(anim)
-	var rock := _mat(Color(0.28, 0.18, 0.14), 0.0, 0.95)
-	for i in 3:
-		var rm := _add_mesh(anim, _sph(0.7, 8, 5), rock, Vector3(rng.randf_range(-0.5, 0.5), 0.2, rng.randf_range(-0.5, 0.5)))
-		rm.scale = Vector3(rng.randf_range(0.9, 1.4), rng.randf_range(0.5, 0.8), rng.randf_range(0.9, 1.4))
-	var cmat := _mat(col, 0.3, 0.25, col, 1.6)
-	for i in 5:
-		_add_mesh(anim, _cyl(0.0, rng.randf_range(0.12, 0.22), rng.randf_range(0.6, 1.2), 5), cmat,
-			Vector3(rng.randf_range(-0.6, 0.6), 0.55, rng.randf_range(-0.6, 0.6)),
-			Vector3(rng.randf_range(-25, 25), rng.randf_range(0, 360), rng.randf_range(-25, 25)))
-	if q_tier == "HIGH":
-		var l := OmniLight3D.new()
-		l.light_color = col
-		l.light_energy = 0.8
-		l.omni_range = 4.0
-		l.position = Vector3(0, 1.0, 0)
-		root.add_child(l)
-	return _add_interact("deposit", root.position, "Mine " + str(info["name"]), 2.8,
-		{"hold": true, "kind": kind, "hp": 3, "node": root, "anim": anim, "dynamic": true})
-
-
-func _deposit_count() -> int:
-	var n := 0
-	for it in interactables:
-		if str(it["act"]) == "deposit":
-			n += 1
-	return n
-
-
-func _random_open_pos(rmin: float, rmax: float, margin: float, r: RandomNumberGenerator) -> Vector3:
-	for attempt in 60:
-		var ang := r.randf() * TAU
-		var rad := r.randf_range(rmin, rmax)
-		var pos := Vector3(cos(ang) * rad, 0.0, -5.0 + sin(ang) * rad)
-		if _clear_of_structures(pos, margin):
-			return pos
-	return Vector3(40, 0, 40)
-
-
-func _spawn_initial_deposits() -> void:
-	_spawn_deposit(Vector3(-7.0, 0.0, 9.0), "iron")
-	var r := RandomNumberGenerator.new()
-	r.seed = 777 + expedition
-	for i in MAX_DEPOSITS - 6:
-		_spawn_deposit(_random_open_pos(18.0, 150.0, 4.0, r))
-
-
-func _spawn_gems() -> void:
-	for c in collectibles:
-		var gn: Node = c["node"]
-		if is_instance_valid(gn):
-			gn.queue_free()
-	collectibles.clear()
-	var r := RandomNumberGenerator.new()
-	r.seed = 20261115 + expedition * 131
-	var gem_mat := _mat(Color(0.3, 1.0, 0.5), 0.2, 0.1, Color(0.2, 1.0, 0.45), 3.0)
-	var beam_mat := _additive(Color(0.3, 1.0, 0.5, 0.28))
-	for i in gem_target + 2:
-		var pos := _random_open_pos(25.0, 120.0 + 10.0 * float(expedition), 5.0, r)
-		var root := Node3D.new()
-		root.position = pos
-		surface_root.add_child(root)
-		var anim := Node3D.new()
-		anim.position.y = 1.1
-		root.add_child(anim)
-		_add_mesh(anim, _sph(0.32, 6, 4), gem_mat).scale = Vector3(0.8, 1.3, 0.8)
-		_add_mesh(root, _cyl(0.05, 0.05, 16.0, 8), beam_mat, Vector3(0, 8.0, 0))
-		var gl := OmniLight3D.new()
-		gl.light_color = Color(0.3, 1.0, 0.5)
-		gl.light_energy = 1.4
-		gl.omni_range = 6.0
-		gl.position = Vector3(0, 1.0, 0)
-		root.add_child(gl)
-		collectibles.append({"node": root, "anim": anim, "phase": r.randf() * TAU})
-
-
-func _spawn_crate(pos: Vector3, rarity: int, falling: bool, fixed := {}, label := "") -> Dictionary:
-	var rc: Color = RARITY_COLORS[rarity]
-	var root := Node3D.new()
-	root.position = Vector3(pos.x, 60.0 if falling else 0.0, pos.z)
-	surface_root.add_child(root)
-	_add_mesh(root, _box(Vector3(1.2, 0.9, 1.2)), _mat(Color(0.85, 0.85, 0.82), 0.3, 0.5), Vector3(0, 0.45, 0))
-	_add_mesh(root, _box(Vector3(1.24, 0.14, 1.24)), _mat(rc, 0.2, 0.4, rc, 2.0), Vector3(0, 0.55, 0))
-	for sx in [-0.55, 0.55]:
-		var sxf: float = sx
-		_add_mesh(root, _box(Vector3(0.1, 0.92, 1.22)), hm_trim, Vector3(sxf, 0.45, 0))
-	_add_mesh(root, _cyl(0.06, 0.06, 18.0, 8), _additive(Color(rc.r, rc.g, rc.b, 0.3)), Vector3(0, 9.0, 0))
-	var chute_node: Node3D = null
-	if falling:
-		chute_node = Node3D.new()
-		chute_node.position = Vector3(0, 4.5, 0)
-		root.add_child(chute_node)
-		var cm := _mat(rc.lerp(Color.WHITE, 0.3), 0.0, 0.7)
-		cm.cull_mode = BaseMaterial3D.CULL_DISABLED
-		_add_mesh(chute_node, _sph(2.2, 16, 6, true), cm)
-		for i in 4:
-			var a := TAU * float(i) / 4.0
-			_line_mesh(chute_node, Vector3(cos(a) * 2.1, 0, sin(a) * 2.1), Vector3(0, -3.6, 0), 0.025, hm_hull)
-	var l := OmniLight3D.new()
-	l.light_color = rc
-	l.light_energy = 1.5
-	l.omni_range = 7.0
-	l.position = Vector3(0, 1.2, 0)
-	root.add_child(l)
-	var lbl := label if label != "" else "Open %s supply drop" % RARITY_NAMES[rarity]
-	return _add_interact("crate", Vector3(pos.x, 0, pos.z), lbl, 2.4,
-		{"node": root, "rarity": rarity, "falling": falling, "chute": chute_node, "fixed": fixed, "dynamic": true})
-
-
-func _roll_rarity() -> int:
-	var bonus := 0.01 * float(mini(streak, 10))
-	var r := rng.randf()
-	if r < 0.03 + bonus * 0.5:
-		return 3
-	if r < 0.15 + bonus:
-		return 2
-	if r < 0.45 + bonus:
-		return 1
-	return 0
-
-
-func _loot_for(rar: int) -> Dictionary:
-	match rar:
-		0:
-			return {"ration": 2, "iron": 2}
-		1:
-			return {"power_cell": 1, "silica": 3, "greens": 2}
-		2:
-			return {"titanium": 2, "energy_bar": 3, "xp": 150}
-	return {"titanium": 3, "power_cell": 2, "ice": 4, "xp": 400}
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  INVENTORY & CRAFTING
-# ═══════════════════════════════════════════════════════════════════════════
-func _inv_count(id: String) -> int:
-	return int(inventory.get(id, 0))
-
-
-func _inv_add(id: String, n: int) -> bool:
-	if not inventory.has(id) and inventory.size() >= INV_SLOTS:
-		_toast("Inventory full! Use or craft items to free a slot.", 3.0, Color(1, 0.5, 0.4))
-		return false
-	inventory[id] = mini(_inv_count(id) + n, STACK_MAX)
-	return true
-
-
-func _inv_remove(id: String, n: int) -> bool:
-	if _inv_count(id) < n:
-		return false
-	var left := _inv_count(id) - n
-	if left <= 0:
-		inventory.erase(id)
-	else:
-		inventory[id] = left
-	return true
-
-
-func _use_item(id: String) -> void:
-	if state != SimState.SURFACE or sleeping or intro_phase != Intro.NONE:
-		return
-	var info: Dictionary = ITEMS.get(id, {})
-	if info.is_empty():
-		return
-	var cat: String = info["cat"]
-	if _inv_count(id) <= 0:
-		_toast("No %s in your inventory" % info["name"])
-		return
-	if cat == "food":
-		if food >= 99.0:
-			_toast("You're not hungry right now")
-			return
-		_inv_remove(id, 1)
-		food = minf(100.0, food + float(info.get("food", 0.0)))
-		rest = minf(100.0, rest + float(info.get("rest", 0.0)))
-		tut_flags["ate"] = true
-		_toast("Ate %s  +%d Food" % [info["name"], int(info.get("food", 0.0))], 2.6, Color(0.6, 1.0, 0.5))
-	elif cat == "tool":
-		if power >= 99.0:
-			_toast("Power is already full")
-			return
-		_inv_remove(id, 1)
-		power = minf(100.0, power + float(info.get("power", 0.0)))
-		_toast("Power Cell installed  +35 Power", 2.6, Color(1.0, 0.9, 0.4))
-	else:
-		_toast("%s — %s" % [info["name"], info["desc"]], 3.5)
-		return
-	if ui_modal == "inventory":
-		_open_modal("inventory", false)
-
-
-func _eat_best() -> void:
-	for id in ["ration", "greens", "energy_bar"]:
-		if _inv_count(id) > 0:
-			_use_item(id)
-			return
-	_toast("No food! Try the galley dispenser, the greenhouse or a supply drop.", 3.5, Color(1, 0.6, 0.4))
-
-
-func _can_afford(cost: Dictionary) -> bool:
-	for k in cost.keys():
-		if _inv_count(str(k)) < int(cost[k]):
-			return false
-	return true
-
-
-func _craft(r: Dictionary) -> void:
-	var cost: Dictionary = r["cost"]
-	var id: String = r["id"]
-	if id == "drill" and drill_level >= 3:
-		_toast("Drill already at max level")
-		return
-	if not _can_afford(cost):
-		_toast("Not enough materials")
-		return
-	for k in cost.keys():
-		_inv_remove(str(k), int(cost[k]))
-	var out: Dictionary = r["out"]
-	for k in out.keys():
-		_inv_add(str(k), int(out[k]))
-	if id == "drill":
-		drill_level += 1
-		_toast("DRILL UPGRADED to level %d — faster mining, bonus yields!" % drill_level, 3.5, Color(0.8, 0.6, 1.0))
-	else:
-		_toast("Crafted %s" % r["name"], 2.6, Color(1.0, 0.8, 0.4))
-	total_crafted += 1
-	tut_flags["crafted"] = true
-	_daily_progress("craft")
-	_award_xp(15)
-	_check_achievements()
-	_open_modal("craft", false)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  PROGRESSION: XP, COMBO, STREAKS, DAILIES, ACHIEVEMENTS, SAVE
-# ═══════════════════════════════════════════════════════════════════════════
-func _xp_needed(lv: int) -> int:
-	return 100 + (lv - 1) * 60
-
-
-func _award_xp(base: int, combo_action := true) -> void:
-	var mult := float(_br()["xp"])
-	if combo_action:
-		combo = combo + 1 if combo_timer > 0.0 else 1
-		combo_timer = COMBO_WINDOW
-		mult *= 1.0 + 0.25 * float(mini(combo, 9) - 1)
-		if combo >= 9:
-			_unlock("combo")
-	xp += int(round(float(base) * mult))
-	while xp >= _xp_needed(level):
-		xp -= _xp_needed(level)
-		level += 1
-		_on_level_up()
-
-
-func _on_level_up() -> void:
-	var unlocked := PackedStringArray()
-	for e in PALETTE + VISORS:
-		var ed: Dictionary = e
-		if int(ed["lvl"]) == level and int(ed["streak"]) == 0:
-			unlocked.append(str(ed["name"]))
-	var msg := "★ LEVEL UP — LEVEL %d ★" % level
-	if unlocked.size() > 0:
-		msg += "   Unlocked: " + ", ".join(unlocked)
-	_toast(msg, 4.5, Color(1.0, 0.85, 0.3))
-	_flash(Color(1.0, 0.8, 0.3), 0.35)
-	shake = maxf(shake, 0.3)
-	if state == SimState.SURFACE:
-		_inv_add("power_cell", 1)
-	_save()
-
-
-func _unlock(id: String) -> void:
-	if id in achievements or not ACHIEVEMENTS.has(id):
-		return
-	achievements.append(id)
-	var a: Array = ACHIEVEMENTS[id]
-	_toast("ACHIEVEMENT UNLOCKED — %s" % a[0], 4.0, Color(1.0, 0.75, 0.3))
-	_award_xp(75, false)
-	_save()
-
-
-func _check_achievements() -> void:
-	if total_mined >= 25:
-		_unlock("miner25")
-	if total_mined >= 100:
-		_unlock("miner100")
-	if total_gems >= 10:
-		_unlock("gems10")
-	if total_drive >= 1000.0:
-		_unlock("drive1k")
-	if total_harvest >= 10:
-		_unlock("harvest10")
-	if total_crafted >= 10:
-		_unlock("crafter")
-	if expeditions_done >= 3:
-		_unlock("exped3")
-
-
-func _check_streak_unlocks() -> void:
-	if streak >= 3:
-		_unlock("streak3")
-	if streak >= 7:
-		_unlock("streak7")
-
-
-func _is_unlocked(e: Dictionary) -> bool:
-	return level >= int(e["lvl"]) and best_streak >= int(e["streak"])
-
-
-func _today() -> int:
-	return int(Time.get_unix_time_from_system() / 86400.0)
-
-
-func _compute_streak() -> int:
-	if DEMO_STREAK > 0:
-		return DEMO_STREAK
-	var today := _today()
-	if streak_last_day == today:
-		streak = maxi(streak, 1)
-	elif streak_last_day == today - 1:
-		streak += 1
-	else:
-		streak = 1
-	streak_last_day = today
-	_save()
-	return streak
-
-
-func _ensure_daily() -> void:
-	var today := _today()
-	if daily_day == today and daily.size() == 3:
-		return
-	daily_day = today
-	daily = []
-	var r := RandomNumberGenerator.new()
-	r.seed = today * 7919
-	var idx: Array = range(DAILY_POOL.size())
-	for i in range(idx.size() - 1, 0, -1):
-		var j := r.randi_range(0, i)
-		var tmp: Variant = idx[i]
-		idx[i] = idx[j]
-		idx[j] = tmp
-	for i in 3:
-		var def: Dictionary = DAILY_POOL[int(idx[i])]
-		var g := maxi(1, int(ceil(float(def["goal"]) * float(_br()["goal_mult"]))))
-		daily.append({"type": def["type"], "goal": g, "text": str(def["text"]) % g, "prog": 0.0, "done": false})
-
-
-func _daily_progress(kind: String, amount := 1.0) -> void:
-	for d in daily:
-		var dd: Dictionary = d
-		if str(dd["type"]) != kind or bool(dd["done"]):
-			continue
-		dd["prog"] = float(dd["prog"]) + amount
-		if float(dd["prog"]) >= float(dd["goal"]):
-			dd["done"] = true
-			_toast("DAILY MISSION COMPLETE — %s  (+120 XP, +1 Power Cell)" % dd["text"], 4.0, Color(0.5, 1.0, 0.6))
-			_award_xp(120, false)
-			_inv_add("power_cell", 1)
-			_save()
-
-
-func _give_daily_reward() -> void:
-	var today := _today()
-	if claimed_day == today:
-		return
-	claimed_day = today
-	var rations := mini(1 + streak / 2, 5)
-	_inv_add("ration", rations)
-	_inv_add("ice", 2)
-	if streak >= 5:
-		_inv_add("titanium", 1)
-	_award_xp(20 * mini(streak, 10), false)
-	_toast("DAILY SUPPLY — Day %d streak: +%d Rations, +2 Ice%s" % [streak, rations, ", +1 Titanium" if streak >= 5 else ""], 5.0, Color(1.0, 0.75, 0.35))
-	_save()
-
-
-func _save() -> void:
-	var cfg := ConfigFile.new()
-	var vals := {
-		"level": level, "xp": xp, "drill": drill_level, "total_gems": total_gems, "total_mined": total_mined,
-		"total_harvest": total_harvest, "total_crafted": total_crafted, "total_drive": total_drive,
-		"expeditions": expeditions_done, "streak": streak, "best_streak": best_streak,
-		"streak_last_day": streak_last_day, "claimed_day": claimed_day, "achievements": achievements,
-		"tutorial_done": tutorial_done, "suit": suit_idx, "visor": visor_idx, "accent": accent_idx,
-		"rover": rover_idx, "callsign": callsign, "daily_day": daily_day, "daily": daily, "age": cadet_age,
-	}
-	for k in vals.keys():
-		cfg.set_value("p", str(k), vals[k])
-	cfg.save(SAVE_PATH)
-
-
-func _load_save() -> void:
-	var cfg := ConfigFile.new()
-	if cfg.load(SAVE_PATH) != OK:
-		return
-	level = int(cfg.get_value("p", "level", 1))
-	xp = int(cfg.get_value("p", "xp", 0))
-	drill_level = int(cfg.get_value("p", "drill", 1))
-	total_gems = int(cfg.get_value("p", "total_gems", 0))
-	total_mined = int(cfg.get_value("p", "total_mined", 0))
-	total_harvest = int(cfg.get_value("p", "total_harvest", 0))
-	total_crafted = int(cfg.get_value("p", "total_crafted", 0))
-	total_drive = float(cfg.get_value("p", "total_drive", 0.0))
-	expeditions_done = int(cfg.get_value("p", "expeditions", 0))
-	streak = int(cfg.get_value("p", "streak", 1))
-	best_streak = int(cfg.get_value("p", "best_streak", 1))
-	streak_last_day = int(cfg.get_value("p", "streak_last_day", 0))
-	claimed_day = int(cfg.get_value("p", "claimed_day", 0))
-	tutorial_done = bool(cfg.get_value("p", "tutorial_done", false))
-	suit_idx = int(cfg.get_value("p", "suit", 0))
-	visor_idx = int(cfg.get_value("p", "visor", 0))
-	accent_idx = int(cfg.get_value("p", "accent", 1))
-	rover_idx = int(cfg.get_value("p", "rover", 1))
-	callsign = str(cfg.get_value("p", "callsign", "CADET"))
-	daily_day = int(cfg.get_value("p", "daily_day", 0))
-	cadet_age = int(cfg.get_value("p", "age", 16))
-	var a: Variant = cfg.get_value("p", "achievements", [])
-	if a is Array:
-		achievements = (a as Array).duplicate()
-	var dl: Variant = cfg.get_value("p", "daily", [])
-	if dl is Array:
-		daily = (dl as Array).duplicate(true)
-	play_tutorial = not tutorial_done
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  STATE SWITCHING
-# ═══════════════════════════════════════════════════════════════════════════
-func _enter_state(s: int) -> void:
-	state = s
-	var in_menu := s == SimState.MENU_ORBIT
-	menu_root.visible = in_menu
-	surface_root.visible = not in_menu
-	menu_layer.visible = in_menu
-	hud_layer.visible = not in_menu and intro_phase == Intro.NONE
-	intro_layer.visible = not in_menu and intro_phase != Intro.NONE
-	if in_menu:
-		_close_modal()
-		menu_camera.current = true
-		_refresh_menu_profile()
-		launch_btn.grab_focus()
-	else:
-		get_viewport().gui_release_focus()
-		surface_camera.current = true
-	dragging = false
-
-
-func _transition_to(s: int) -> void:
-	if transitioning:
-		return
-	transitioning = true
-	var tw := create_tween()
-	tw.tween_property(fade_rect, "color:a", 1.0, 0.45)
-	await tw.finished
-	if s == SimState.SURFACE:
-		_reset_mission()
-	_enter_state(s)
-	var tw2 := create_tween()
-	tw2.tween_property(fade_rect, "color:a", 0.0, 0.8)
-	await tw2.finished
-	transitioning = false
-
-
-func _on_launch_pressed() -> void:
-	_save()
-	_transition_to(SimState.SURFACE)
-
-
-func _return_to_menu() -> void:
-	tut_active = false
-	tut_panel.visible = false
-	intro_phase = Intro.NONE
-	_close_modal()
-	_save()
-	_transition_to(SimState.MENU_ORBIT)
-
-
-func _reset_mission() -> void:
-	bracket = _bracket_for(cadet_age)
-	expedition = 1
-	difficulty = _difficulty_for()
-	ease = 1.0
-	exhaust_events = 0
-	was_exhausted = false
-	power = 100.0
-	food = 85.0
-	rest = 90.0
-	gems = 0
-	gem_target = int(_br()["gems"])
-	mission_time = 0.0
-	mission_complete = false
-	hazard = Hazard.NONE
-	hazard_timer = 70.0
-	sleeping = false
-	power_warned = false
-	inventory = {"ration": 1}
-	combo = 0
-	combo_timer = 0.0
-	drop_timer = 75.0
-	deposit_timer = 25.0
-	fact_timer = 35.0
-	play_time = 0.0
-	break_at = 0.0
-	rover_speed = 0.0
-	rover_heading = 0.5
-	rover.position = ROVER_START
-	rover.rotation.y = rover_heading
-	driving = false
-	inside_base = false
-	player_pos = SPAWN_POS
-	player_heading = 0.0
-	cam_yaw = 0.0
-	cam_pitch = 0.38
-	cam_dist = 8.0
-	cam_eff_dist = 8.0
-	cam_target = player_pos
-	sleep_overlay.visible = false
-	tut_active = false
-	tut_panel.visible = false
-	_clear_dynamic()
-	_spawn_gems()
-	_spawn_initial_deposits()
-	tut_crate_pos = Vector3(5.0, 0.0, 12.0)
-	_spawn_crate(tut_crate_pos, 0, false, {"ration": 2, "iron": 2, "silica": 1, "greens": 1}, "Open welcome supply crate")
-	_close_modal()
-	_update_hud()
-	_start_intro()
-
-
-func _next_expedition() -> void:
-	expedition += 1
-	difficulty = _difficulty_for()
-	gem_target = mini(gem_target + 1, 14)
-	gems = 0
-	mission_complete = false
-	mission_time = 0.0
-	food = minf(100.0, food + 30.0)
-	rest = minf(100.0, rest + 30.0)
-	power = minf(100.0, power + 30.0)
-	_spawn_gems()
-	_close_modal()
-	_toast("EXPEDITION %d — %d new gems detected. Difficulty ×%.2f" % [expedition, gem_target, difficulty], 5.0, Color(0.5, 1.0, 0.6))
-
-
-func _mission_complete() -> void:
-	mission_complete = true
-	expeditions_done += 1
-	_award_xp(300, false)
-	_inv_add("titanium", 2)
-	_check_achievements()
-	_save()
-	_flash(Color(0.4, 1.0, 0.5), 0.4)
-	_toast("★ ALL ISOTOPE GEMS RECOVERED — EXPEDITION COMPLETE ★", 5.0, Color(0.5, 1.0, 0.6))
-	get_tree().create_timer(1.6).timeout.connect(func():
-		if state == SimState.SURFACE and mission_complete and ui_modal == "":
-			_open_modal("summary"))
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  CAPSULE INTRO
-# ═══════════════════════════════════════════════════════════════════════════
-func _start_intro() -> void:
-	intro_phase = Intro.ENTRY
-	cap_y = CAPSULE_START_Y
-	cap_vel = 75.0
-	capsule.position = Vector3(PAD_POS.x, cap_y, PAD_POS.z)
-	capsule_glow.visible = true
-	capsule_trail.emitting = q_particles
-	capsule_flame.emitting = false
-	capsule_light.visible = false
-	hatch_hinge.rotation.y = 0.0
-	chute.visible = false
-	chute_attached = true
-	chute_age = 0.0
-	chute.rotation = Vector3.ZERO
-	intro_orbit = 0.6
-	intro_dist = 26.0
-	astro.visible = false
-	intro_msg.modulate.a = 0.0
-	letter_top.offset_bottom = 90.0
-	letter_bot.offset_top = -90.0
-	_intro_message("ARES-7  •  ATMOSPHERIC ENTRY")
-
-
-func _intro_message(t: String) -> void:
-	intro_msg.text = t
-	intro_msg.modulate.a = 1.0
-	var tw := create_tween()
-	tw.tween_property(intro_msg, "modulate:a", 0.0, 1.2).set_delay(1.6)
-
-
-func _process_intro(delta: float) -> void:
-	match intro_phase:
-		Intro.ENTRY:
-			cap_vel = lerpf(cap_vel, 55.0, delta * 0.5)
-			cap_y -= cap_vel * delta
-			shake = maxf(shake, 0.15)
-			(capsule_glow.material_override as StandardMaterial3D).albedo_color.a = 0.4 + 0.25 * sin(time_accum * 30.0)
-			if cap_y <= 150.0:
-				intro_phase = Intro.CHUTE
-				capsule_glow.visible = false
-				capsule_trail.emitting = false
-				chute.visible = true
-				chute.scale = Vector3(0.1, 0.1, 0.1)
-				create_tween().tween_property(chute, "scale", Vector3.ONE, 0.8).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-				shake = 0.7
-				_intro_message("PARACHUTE DEPLOYED")
-		Intro.CHUTE:
-			cap_vel = lerpf(cap_vel, 10.0, delta * 1.8)
-			cap_y -= cap_vel * delta
-			if cap_y <= 24.0:
-				intro_phase = Intro.RETRO
-				chute_attached = false
-				chute_drift = Vector3(rng.randf_range(-4.0, 4.0), 3.0, rng.randf_range(-4.0, 4.0))
-				capsule_flame.emitting = true
-				capsule_light.visible = true
-				_intro_message("RETRO-ROCKETS FIRING")
-		Intro.RETRO:
-			cap_vel = lerpf(cap_vel, 2.2, delta * 2.2)
-			cap_y -= cap_vel * delta
-			shake = maxf(shake, 0.25)
-			capsule_light.light_energy = 6.0 + rng.randf() * 3.0
-			if cap_y <= 0.0:
-				cap_y = 0.0
-				intro_phase = Intro.LANDED
-				intro_timer = 1.6
-				capsule_flame.emitting = false
-				capsule_light.visible = false
-				landing_dust.restart()
-				landing_dust.emitting = true
-				shake = 1.0
-				_intro_message("TOUCHDOWN — WELCOME TO GALE CRATER")
-		Intro.LANDED:
-			intro_timer -= delta
-			if intro_timer <= 0.0:
-				create_tween().tween_property(hatch_hinge, "rotation:y", -1.9, 0.9).set_trans(Tween.TRANS_BACK)
-				intro_phase = Intro.EGRESS
-				intro_timer = 2.4
-				player_pos = Vector3(PAD_POS.x, PLAYER_Y, PAD_POS.z - 1.6)
-				player_heading = 0.0
-				astro.visible = true
-		Intro.EGRESS:
-			intro_timer -= delta
-			is_moving = false
-			if intro_timer < 1.6:
-				player_pos = player_pos.move_toward(SPAWN_POS, WALK_SPEED * 0.7 * delta)
-				is_moving = player_pos.distance_to(SPAWN_POS) > 0.05
-				walk_phase += delta * 6.0
-			astro.position = player_pos
-			_animate_astronaut(delta)
-			if intro_timer <= 0.0:
-				_finish_intro()
-				return
-	capsule.position = Vector3(PAD_POS.x, cap_y, PAD_POS.z)
-	if chute.visible:
-		if chute_attached:
-			chute.position = capsule.position + Vector3(0, 14.0, 0)
-			chute.rotation.z = sin(time_accum * 1.3) * 0.06
-		else:
-			chute_age += delta
-			chute.position += chute_drift * delta
-			chute.rotation.z += delta * 0.3
-			if chute_age > 5.0:
-				chute.visible = false
-	intro_label.text = "ALT %6.1f m    VEL %5.1f m/s    TARGET: GALE OUTPOST PAD" % [cap_y, cap_vel]
-
-
-func _update_camera_intro(delta: float) -> void:
-	intro_orbit += delta * 0.22
-	var tgt := capsule.position + Vector3(0, 2.0, 0)
-	var want := 13.0
-	var pitch := 0.25
-	match intro_phase:
-		Intro.ENTRY:
-			want = 26.0
-			pitch = -0.1
-		Intro.CHUTE:
-			want = 22.0
-			pitch = -0.2
-		Intro.EGRESS:
-			tgt = player_pos + Vector3(0, 1.0, 0)
-			want = 9.0
-	intro_dist = lerpf(intro_dist, want, clampf(delta * 1.5, 0.0, 1.0))
-	var off := Vector3(sin(intro_orbit) * cos(pitch), sin(pitch), cos(intro_orbit) * cos(pitch)) * intro_dist
-	var pos := tgt + off
-	pos.y = maxf(pos.y, 1.0)
-	surface_camera.look_at_from_position(pos, tgt, Vector3.UP)
-
-
-func _finish_intro() -> void:
-	intro_phase = Intro.NONE
-	cap_y = 0.0
-	capsule.position = PAD_POS
-	chute.visible = false
-	capsule_glow.visible = false
-	capsule_trail.emitting = false
-	capsule_flame.emitting = false
-	capsule_light.visible = false
-	hatch_hinge.rotation.y = -1.9
-	astro.visible = true
-	player_pos = SPAWN_POS
-	cam_target = player_pos
-	cam_yaw = 0.0
-	var tw := create_tween()
-	tw.tween_property(letter_top, "offset_bottom", 0.0, 0.6)
-	tw.parallel().tween_property(letter_bot, "offset_top", 0.0, 0.6)
-	tw.tween_callback(func(): intro_layer.visible = false)
-	hud_layer.visible = true
-	_give_daily_reward()
-	if play_tutorial:
-		_start_tutorial()
-	else:
-		_toast("Welcome back, %s — find the green beacons ◆" % callsign, 4.0)
-
-
-func _skip_intro() -> void:
-	if intro_phase == Intro.NONE:
-		return
-	_finish_intro()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  TUTORIAL (branches by age bracket)
-# ═══════════════════════════════════════════════════════════════════════════
-func _start_tutorial() -> void:
-	tut_steps = []
-	for s in TUTORIAL:
-		var sd: Dictionary = s
-		var skip: Array = sd["skip"]
-		if not skip.has(bracket):
-			tut_steps.append(sd)
-	tut_index = 0
-	tut_cam_drag = 0.0
-	tut_walk = 0.0
-	tut_sprint = 0.0
-	tut_drive = 0.0
-	tut_flags = {}
-	tut_active = true
-	_refresh_tut_panel()
-	_toast("TRAINING STARTED — follow the panel on the left", 3.5, Color(0.6, 0.85, 1.0))
-
-
-func _tut_check(id: String) -> bool:
-	match id:
-		"look":
-			return tut_cam_drag > 350.0
-		"move":
-			return tut_walk > 10.0
-		"sprint":
-			return tut_sprint > 1.5
-		"base":
-			return inside_base
-		"rover":
-			return tut_drive > 40.0
-		"done":
-			return false
-	return bool(tut_flags.get(id, false))
-
-
-func _update_tutorial(delta: float) -> void:
-	if not tut_active or tut_index >= tut_steps.size():
-		return
-	var step: Dictionary = tut_steps[tut_index]
-	var id: String = step["id"]
-	if id == "done":
-		tut_done_timer -= delta
-		if tut_done_timer <= 0.0:
-			_end_tutorial(true)
-		return
-	if _tut_check(id):
-		tut_index += 1
-		_award_xp(20, false)
-		_fx_burst(player_pos + Vector3(0, 1.2, 0), Color(0.5, 0.85, 1.0))
-		_toast("✓ %s complete  +XP" % step["title"], 2.4, Color(0.6, 0.9, 1.0))
-		var nxt: Dictionary = tut_steps[tut_index]
-		if str(nxt["id"]) == "done":
-			tut_done_timer = 8.0
-		_refresh_tut_panel()
-
-
-func _end_tutorial(completed: bool) -> void:
-	tut_active = false
-	tut_panel.visible = false
-	tutorial_done = true
-	play_tutorial = false
-	if completed:
-		_unlock("tutorial")
-		_award_xp(100, false)
-	_save()
-
-
-func _refresh_tut_panel() -> void:
-	tut_panel.visible = tut_active
-	if not tut_active:
-		return
-	var step: Dictionary = tut_steps[tut_index]
-	var texts: Array = step["t"]
-	tut_title.text = "TRAINING  %d / %d   •   %s" % [tut_index + 1, tut_steps.size(), step["title"]]
-	tut_text.text = str(texts[bracket])
-	tut_prog.max_value = tut_steps.size() - 1
-	tut_prog.value = tut_index
-	tut_panel.modulate = Color(1.6, 1.6, 1.6)
-	create_tween().tween_property(tut_panel, "modulate", Color.WHITE, 0.6)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  SURFACE LOOP
-# ═══════════════════════════════════════════════════════════════════════════
-func _process_surface(delta: float) -> void:
-	_animate_world(delta)
-	if intro_phase != Intro.NONE:
-		_process_intro(delta)
-		if intro_phase != Intro.NONE:
-			_update_camera_intro(delta)
-		_apply_shake(delta)
-		return
-	if ui_modal in ["pause", "summary", "break"]:
-		_update_camera(delta)
-		return
-	mission_time += delta
-	play_time += delta
-	autosave_timer -= delta
-	if autosave_timer <= 0.0:
-		autosave_timer = 30.0
-		_save()
-	_update_hazard(delta)
-	_process_sleep(delta)
-	_handle_movement(delta)
-	inside_base = not driving and base_rect.has_point(Vector2(player_pos.x, player_pos.z))
-	roof_root.visible = not inside_base
-	_update_survival(delta)
-	_update_collectibles(delta)
-	_update_interactables(delta)
-	_update_focus()
-	_process_mining(delta)
-	_update_spawners(delta)
-	_update_combo(delta)
-	_update_tutorial(delta)
-	_update_objective()
-	_update_facts(delta)
-	_check_break()
-	_update_camera(delta)
-	_apply_shake(delta)
-	_update_environment(delta)
-	_animate_astronaut(delta)
-	if not player_pos.is_finite():
-		player_pos = SPAWN_POS
-	player_pos.y = PLAYER_Y
-	rover.position.y = PLAYER_Y
-	astro.position = player_pos
-	hud_timer -= delta
-	if hud_timer <= 0.0:
-		hud_timer = 0.08
-		_update_hud()
-
-
-func _animate_world(delta: float) -> void:
-	holo_globe.rotate_y(delta * 0.5)
-	hab_beacon_mat.emission_energy_multiplier = 4.0 if fmod(time_accum, 1.2) < 0.6 else 0.5
-	pad_light_mat.emission_energy_multiplier = 1.0 + 3.0 * (0.5 + 0.5 * sin(time_accum * 4.0))
-	for f in o2_fans:
-		f.rotate_y(delta * 6.0)
-	drone.position.y = 2.0 + sin(time_accum * 2.0) * 0.15
-	drone.rotation.y += delta * 0.4
-
-
-func _handle_movement(delta: float) -> void:
-	is_moving = false
-	var ix := 0.0
-	var iz := 0.0
-	if not sleeping and ui_modal == "":
-		if Input.is_physical_key_pressed(KEY_W) or Input.is_physical_key_pressed(KEY_UP):
-			iz -= 1.0
-		if Input.is_physical_key_pressed(KEY_S) or Input.is_physical_key_pressed(KEY_DOWN):
-			iz += 1.0
-		if Input.is_physical_key_pressed(KEY_A) or Input.is_physical_key_pressed(KEY_LEFT):
-			ix -= 1.0
-		if Input.is_physical_key_pressed(KEY_D) or Input.is_physical_key_pressed(KEY_RIGHT):
-			ix += 1.0
-	var vitals := 1.0
-	if food <= 0.0 or rest <= 0.0:
-		vitals = 0.75 if bracket == 0 else 0.5
-	if driving:
-		_drive_rover(delta, -iz, -ix, vitals)
-		return
-	rover_speed = move_toward(rover_speed, 0.0, 12.0 * delta)
-	var input := Vector3(ix, 0.0, iz)
-	sprinting = false
-	if input.length() > 0.01:
-		input = input.normalized()
-		var dir := Basis(Vector3.UP, cam_yaw) * input
-		sprinting = Input.is_physical_key_pressed(KEY_SHIFT)
-		var spd := (SPRINT_SPEED if sprinting else WALK_SPEED) * vitals
-		if power <= 0.0:
-			spd *= 0.6
-		var before := player_pos
-		player_pos += dir * spd * delta
-		player_heading = lerp_angle(player_heading, atan2(-dir.x, -dir.z), clampf(delta * 12.0, 0.0, 1.0))
-		walk_phase += delta * spd * 1.7
-		is_moving = true
-		player_pos = _resolve_obstacles(player_pos, 0.6)
-		player_pos = _clamp_world(player_pos)
-		tut_walk += Vector2(player_pos.x - before.x, player_pos.z - before.z).length()
-		if sprinting:
-			tut_sprint += delta
-	player_pos.y = PLAYER_Y
-
-
-func _drive_rover(delta: float, throttle: float, steer: float, vitals: float) -> void:
-	var max_v := ROVER_MAX_SPEED * (0.8 if hazard == Hazard.DUST_STORM else 1.0) * (0.7 if vitals < 1.0 else 1.0)
-	var target := throttle * (max_v if throttle > 0.0 else max_v * 0.5)
-	if power <= 0.0:
-		target = 0.0
-		if not power_warned:
-			power_warned = true
-			_toast("Rover power depleted — use a Power Cell (Q) or recharge at base", 4.0, Color(1, 0.5, 0.4))
-	var rate := ROVER_ACCEL if absf(target) > 0.01 else 7.0
-	rover_speed = move_toward(rover_speed, target, rate * delta)
-	var steer_scale := lerpf(0.5, 1.0, clampf(absf(rover_speed) / 8.0, 0.0, 1.0))
-	var dir_sign := 1.0 if rover_speed >= -0.5 else -1.0
-	rover_heading += steer * ROVER_TURN * steer_scale * dir_sign * delta
-	var fwd := Vector3(-sin(rover_heading), 0.0, -cos(rover_heading))
-	var before := rover.position
-	var np := rover.position + fwd * rover_speed * delta
-	np = _resolve_obstacles(np, 2.0)
-	np = _clamp_world(np)
-	np.y = PLAYER_Y
-	var moved := before.distance_to(np)
-	if moved < absf(rover_speed) * delta * 0.5 - 0.0001:
-		rover_speed *= 0.6
-	rover.position = np
-	rover.rotation.y = rover_heading
-	for w in rover_wheels:
-		w.rotation.x = wrapf(w.rotation.x - rover_speed * delta / 0.5, -PI, PI)
-	total_drive += moved
-	tut_drive += moved
-	if moved > 0.0:
-		_daily_progress("drive", moved)
-	player_pos = rover.position
-	is_moving = absf(rover_speed) > 0.5
-	if not dragging and absf(rover_speed) > 1.0:
-		cam_yaw = lerp_angle(cam_yaw, rover_heading, clampf(delta * 0.9, 0.0, 1.0))
-
-
-func _animate_astronaut(delta: float) -> void:
-	astro.visible = not driving
-	astro_model.rotation.y = player_heading
-	var swing := sin(walk_phase) * 0.7 if is_moving else 0.0
-	var k := clampf(delta * 12.0, 0.0, 1.0)
-	arm_l.rotation.x = lerpf(arm_l.rotation.x, swing, k)
-	arm_r.rotation.x = lerpf(arm_r.rotation.x, -swing, k)
-	leg_l.rotation.x = lerpf(leg_l.rotation.x, -swing, k)
-	leg_r.rotation.x = lerpf(leg_r.rotation.x, swing, k)
-	astro_model.position.y = absf(sin(walk_phase)) * 0.05 if is_moving else 0.0
-	helmet_light.visible = hazard == Hazard.DUST_STORM and not inside_base
-	step_dust.emitting = q_particles and is_moving and not driving and not inside_base
-	rover_dust.emitting = q_particles and driving and absf(rover_speed) > 3.0
-
-
-func _update_camera(delta: float) -> void:
-	var tgt := rover.position if driving else player_pos
-	cam_target = cam_target.lerp(tgt, 1.0 - exp(-9.0 * delta))
-	var dist := cam_dist
-	var pitch := cam_pitch
-	if inside_base:
-		dist = minf(dist, 9.5)
-		pitch = maxf(pitch, 0.85)
-	var k := 1.0 - exp(-6.0 * delta)
-	cam_eff_dist = lerpf(cam_eff_dist, dist, k)
-	cam_eff_pitch = lerpf(cam_eff_pitch, pitch, k)
-	var offset := Vector3(sin(cam_yaw) * cos(cam_eff_pitch), sin(cam_eff_pitch), cos(cam_yaw) * cos(cam_eff_pitch)) * cam_eff_dist
-	var pos := cam_target + offset
-	pos.y = maxf(pos.y, 0.7)
-	surface_camera.look_at_from_position(pos, cam_target + Vector3(0, 1.0, 0), Vector3.UP)
-
-
-func _apply_shake(delta: float) -> void:
-	shake = maxf(0.0, shake - delta * 1.6)
-	var s := shake * shake * 0.35
-	surface_camera.h_offset = rng.randf_range(-s, s)
-	surface_camera.v_offset = rng.randf_range(-s, s)
-
-
-func _update_survival(delta: float) -> void:
-	var near := inside_base or _dist_to_base(player_pos) <= 3.0
-	var d := difficulty * ease
-	if not sleeping:
-		var act := 1.0
-		if is_moving:
-			act = 1.4 if sprinting else 1.2
-		food = maxf(0.0, food - FOOD_DRAIN * d * act * delta)
-		rest = maxf(0.0, rest - REST_DRAIN * d * act * delta)
-	var drain := POWER_DRAIN * d
-	if driving:
-		drain += ROVER_POWER * d * absf(rover_speed) / ROVER_MAX_SPEED
-	var gain := 0.3 * (0.4 if hazard == Hazard.DUST_STORM else 1.0)
-	if near:
-		gain += 6.0
-	power = clampf(power + (gain - drain) * delta, 0.0, 100.0)
-	if power > 5.0:
-		power_warned = false
-	if hazard == Hazard.SOLAR_FLARE and not near and not sleeping:
-		rest = maxf(0.0, rest - 2.0 * d * delta)
-	# adaptive difficulty: help players who keep running dry
-	var exhausted := food <= 0.0 or rest <= 0.0
-	if exhausted and not was_exhausted:
-		exhaust_events += 1
-		if bracket <= 1 or exhaust_events >= 3:
-			ease = maxf(0.6, ease - 0.1)
-			_toast("Mission Control: suit systems tuned to drain %d%% slower. Eat (E) and rest in a bunk!" % int((1.0 - ease) * 100.0), 5.0, Color(0.6, 0.85, 1.0))
-		else:
-			_toast("EXHAUSTED — speed halved. Eat (E) and sleep in a bunk!", 4.0, Color(1, 0.5, 0.4))
-	was_exhausted = exhausted
-
-
-func _update_hazard(delta: float) -> void:
-	hazard_timer -= delta
-	if hazard_timer > 0.0:
-		return
-	var hm := float(_br()["hazard"])
-	if hazard == Hazard.NONE:
-		var flare_ok := bool(_br()["flare"])
-		hazard = Hazard.SOLAR_FLARE if flare_ok and rng.randf() < 0.4 else Hazard.DUST_STORM
-		hazard_timer = rng.randf_range(20.0, 32.0)
-		if hazard == Hazard.DUST_STORM:
-			_toast("▲ DUST STORM incoming — solar output reduced", 4.0, Color(1.0, 0.65, 0.25))
-		else:
-			_toast("▲ SOLAR FLARE — get inside the base!", 4.0, Color(1.0, 0.35, 0.25))
-			_flash(Color(1.0, 0.6, 0.3), 0.25)
-	else:
-		hazard = Hazard.NONE
-		hazard_timer = rng.randf_range(45.0, 80.0) / (difficulty * hm)
-		_toast("Skies clear", 3.0)
-
-
-func _update_environment(delta: float) -> void:
-	var storm := hazard == Hazard.DUST_STORM
-	var flare := hazard == Hazard.SOLAR_FLARE
-	var k := clampf(delta * 0.9, 0.0, 1.0)
-	surface_env.fog_density = lerpf(surface_env.fog_density, FOG_STORM if storm else FOG_BASE, k)
-	surface_env.fog_light_color = surface_env.fog_light_color.lerp(COL_FOG_STORM if storm else COL_FOG_CLEAR, k)
-	surface_sun.light_energy = lerpf(surface_sun.light_energy, 0.55 if storm else (1.9 if flare else 1.25), k)
-	surface_sun.light_color = surface_sun.light_color.lerp(Color(1.0, 0.62, 0.42) if flare else Color(1.0, 0.88, 0.75), k)
-	surface_env.ambient_light_energy = lerpf(surface_env.ambient_light_energy, 0.5 if storm else 0.75, k)
-	if q_volumetric:
-		surface_env.volumetric_fog_density = lerpf(surface_env.volumetric_fog_density, 0.03 if storm else 0.005, k)
-	dust_particles.emitting = storm and q_particles
-
-
-func _update_collectibles(delta: float) -> void:
-	var reach := 3.4 if driving else 2.4
-	var i := collectibles.size() - 1
-	while i >= 0:
-		var c: Dictionary = collectibles[i]
-		var node: Node3D = c["node"]
-		var anim: Node3D = c["anim"]
-		var phase: float = c["phase"]
-		anim.rotation.y += delta * 1.6
-		anim.position.y = 1.1 + sin(time_accum * 2.0 + phase) * 0.18
-		var d := Vector2(player_pos.x - node.position.x, player_pos.z - node.position.z).length()
-		if d < reach and not mission_complete:
-			gems += 1
-			total_gems += 1
-			_inv_add("gem", 1)
-			power = minf(100.0, power + 12.0)
-			tut_flags["gem"] = true
-			_daily_progress("gems")
-			_award_xp(50)
-			_fx_burst(node.position + Vector3(0, 1, 0), Color(0.3, 1.0, 0.5))
-			_toast("◆ Isotope Gem recovered  (%d / %d)  +12%% power" % [gems, gem_target], 2.8, Color(0.4, 1.0, 0.6))
-			node.queue_free()
-			collectibles.remove_at(i)
-			_check_achievements()
-			if gems >= gem_target:
-				_mission_complete()
-		i -= 1
-
-
-func _update_interactables(delta: float) -> void:
-	for it in interactables:
-		var act: String = it["act"]
-		if act == "plant":
-			var g := minf(1.0, float(it["grow"]) + delta / 55.0)
-			it["grow"] = g
-			var pn: Node3D = it["plant_node"]
-			var s := 0.25 + 0.75 * g
-			pn.scale = Vector3(s, s, s)
-			it["label"] = "Harvest Fresh Greens" if g >= 1.0 else "Growing…  %d%%" % int(g * 100.0)
-		elif act == "crate" and bool(it["falling"]):
-			var node: Node3D = it["node"]
-			node.position.y = maxf(0.0, node.position.y - 7.0 * delta)
-			node.rotation.y += delta * 0.5
-			if node.position.y <= 0.0:
-				it["falling"] = false
-				var ch: Variant = it["chute"]
-				if ch is Node3D:
-					(ch as Node3D).visible = false
-				_fx_burst(node.position + Vector3(0, 0.3, 0), Color(0.85, 0.6, 0.4))
-
-
-func _update_focus() -> void:
-	var best: Dictionary = {}
-	var best_d := 1e9
-	if not driving and not sleeping:
-		for it in interactables:
-			if bool(it.get("falling", false)):
-				continue
-			var ip: Vector3 = it["pos"]
-			var d := Vector2(player_pos.x - ip.x, player_pos.z - ip.z).length()
-			if d < float(it["r"]) and d < best_d:
-				best_d = d
-				best = it
-		var rd := Vector2(player_pos.x - rover.position.x, player_pos.z - rover.position.z).length()
-		if rd < 4.5 and rd < best_d:
-			best = {"act": "rover", "label": "Board ARES rover", "hold": false}
-	focus = best
-
-
-func _process_mining(delta: float) -> void:
-	var holding := Input.is_physical_key_pressed(KEY_F) and ui_modal == "" and not sleeping
-	if not focus.is_empty() and bool(focus.get("hold", false)) and holding:
-		if not is_same(focus, mine_target):
-			mine_target = focus
-			mine_progress = 0.0
-		mine_progress += delta * (0.75 + 0.35 * float(drill_level)) * (1.0 if power > 0.0 else 0.5)
-		var anim: Node3D = focus["anim"]
-		anim.position = Vector3(rng.randf_range(-0.04, 0.04), 0.0, rng.randf_range(-0.04, 0.04))
-		if rng.randf() < 0.15:
-			_fx_burst(Vector3(anim.global_position.x, 0.8, anim.global_position.z), ITEMS[str(focus["kind"])]["col"])
-		if mine_progress >= 1.0:
-			mine_progress = 0.0
-			_mine_yield(focus)
-	else:
-		mine_progress = maxf(0.0, mine_progress - delta * 2.0)
-
-
-func _mine_yield(it: Dictionary) -> void:
-	var kind: String = it["kind"]
-	var n := 1 + (1 if rng.randf() < 0.25 * float(drill_level) else 0)
-	if not _inv_add(kind, n):
-		return
-	var nm: String = ITEMS[kind]["name"]
-	_toast("+%d %s%s" % [n, nm, "  (bonus!)" if n > 1 else ""], 2.0, ITEMS[kind]["col"])
-	it["hp"] = int(it["hp"]) - 1
-	total_mined += 1
-	tut_flags["mine"] = true
-	_daily_progress("mine")
-	_award_xp(10 if kind != "titanium" else 30)
-	shake = maxf(shake, 0.2)
-	_check_achievements()
-	var node: Node3D = it["node"]
-	_fx_burst(node.position + Vector3(0, 0.8, 0), ITEMS[kind]["col"])
-	if int(it["hp"]) <= 0:
-		node.queue_free()
-		_remove_interact(it)
-		mine_target = {}
-	else:
-		var s := 0.55 + 0.15 * float(it["hp"])
-		node.scale = Vector3(s, s, s)
-
-
-func _update_spawners(delta: float) -> void:
-	deposit_timer -= delta
-	if deposit_timer <= 0.0:
-		deposit_timer = 25.0
-		if _deposit_count() < MAX_DEPOSITS:
-			_spawn_deposit(_random_open_pos(30.0, 150.0, 4.0, rng))
-	drop_timer -= delta
-	if drop_timer <= 0.0:
-		drop_timer = rng.randf_range(80.0, 140.0) / maxf(0.7, float(_br()["hazard"]) * 0.5 + 0.5)
-		var ang := rng.randf() * TAU
-		var dist := rng.randf_range(25.0, 60.0)
-		var pos := Vector3(player_pos.x + cos(ang) * dist, 0.0, player_pos.z + sin(ang) * dist)
-		if _clear_of_structures(pos, 3.0):
-			var rar := _roll_rarity()
-			_spawn_crate(_clamp_world(pos), rar, true)
-			_toast("SUPPLY DROP incoming — %s! Check your radar." % RARITY_NAMES[rar], 4.0, RARITY_COLORS[rar])
-
-
-func _update_combo(delta: float) -> void:
-	if combo_timer > 0.0:
-		combo_timer -= delta
-		if combo_timer <= 0.0:
-			if combo >= 3:
-				_toast("Combo ended at ×%.2f" % (1.0 + 0.25 * float(mini(combo, 9) - 1)), 2.0)
-			combo = 0
-
-
-func _nearest_gem() -> Variant:
-	var best: Variant = null
-	var bd := 1e9
-	for c in collectibles:
-		var n: Node3D = c["node"]
-		var d := n.position.distance_to(player_pos)
-		if d < bd:
-			bd = d
-			best = n.position
-	return best
-
-
-func _update_objective() -> void:
-	has_objective = false
-	var target: Variant = null
-	if tut_active and tut_index < tut_steps.size():
-		var id: String = tut_steps[tut_index]["id"]
-		match id:
-			"crate":
-				if not tut_flags.get("crate", false):
-					target = tut_crate_pos
-			"mine":
-				var bd := 1e9
-				for it in interactables:
-					if str(it["act"]) == "deposit":
-						var ip: Vector3 = it["pos"]
-						var d := ip.distance_to(player_pos)
-						if d < bd:
-							bd = d
-							target = ip
-			"base":
-				target = _w(0.0, 11.0)
-			"craft":
-				target = _w(17.0, -20.0)
-			"locker":
-				target = _w(-23.3, -3.7)
-			"sleep":
-				target = _w(-16.1, 4.5)
-			"rover":
-				target = rover.position
-			"gem":
-				target = _nearest_gem()
-	elif bool(_br()["hints"]) and not mission_complete:
-		target = _w(0.0, 11.0) if power < 20.0 and not inside_base else _nearest_gem()
-	if target is Vector3:
-		has_objective = true
-		objective_pos = target
-	objective_marker.visible = has_objective
-	if has_objective:
-		objective_marker.position = objective_pos + Vector3(0, 3.6 + sin(time_accum * 3.0) * 0.3, 0)
-		objective_label.text = "▼\n%d m" % int(Vector2(objective_pos.x - player_pos.x, objective_pos.z - player_pos.z).length())
-
-
-func _update_facts(delta: float) -> void:
-	if fact_time > 0.0:
-		fact_time -= delta
-		fact_panel.modulate.a = clampf(fact_time / 0.6, 0.0, 1.0)
-		if fact_time <= 0.0:
-			fact_panel.visible = false
-	fact_timer -= delta
-	if fact_timer <= 0.0:
-		fact_timer = rng.randf_range(80.0, 120.0)
-		var f: Array = FACTS[fact_index % FACTS.size()]
-		fact_index += 1
-		fact_label.text = "DID YOU KNOW?\n" + str(f[0] if bracket <= 1 else f[1])
-		fact_panel.visible = true
-		fact_panel.modulate.a = 1.0
-		fact_time = 10.0
-
-
-func _check_break() -> void:
-	var mins := int(_br()["break_min"])
-	if mins <= 0 or ui_modal != "":
-		return
-	if play_time - break_at >= float(mins) * 60.0:
-		break_at = play_time
-		_open_modal("break")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  ACTIONS
-# ═══════════════════════════════════════════════════════════════════════════
-func _on_interact_pressed() -> void:
-	if sleeping:
-		return
-	if driving:
-		_toggle_rover()
-		return
-	if focus.is_empty():
-		_toast("Nothing to interact with here")
-		return
-	var act: String = focus["act"]
-	if act == "rover":
-		_toggle_rover()
-	elif not bool(focus.get("hold", false)):
-		_do_interact(focus)
-
-
-func _do_interact(it: Dictionary) -> void:
-	var act: String = it["act"]
-	var cd_until := float(it.get("cd", 0.0))
-	if cd_until > time_accum:
-		_toast("Recharging — ready in %ds" % ceili(cd_until - time_accum))
-		return
-	match act:
-		"bunk":
-			_start_sleep()
-		"locker":
-			tut_flags["locker"] = true
-			_open_modal("custom")
-		"fabricator", "drill_rack":
-			_open_modal("craft")
-		"terminal":
-			_open_modal("terminal")
-		"dispenser":
-			if _inv_add("ration", 1):
-				it["cd"] = time_accum + 45.0
-				_toast("Dispenser: +1 Ration Pack", 2.4, Color(0.6, 1.0, 0.5))
-				_award_xp(4)
-		"fridge":
-			var got := "greens" if rng.randf() < 0.6 else "energy_bar"
-			if _inv_add(got, 1):
-				it["cd"] = time_accum + 90.0
-				_toast("Fridge: +1 %s" % ITEMS[got]["name"], 2.4, Color(0.6, 1.0, 0.5))
-		"coffee":
-			rest = minf(100.0, rest + 12.0)
-			it["cd"] = time_accum + 40.0
-			_toast("Hot coffee  +12 Rest", 2.4, Color(0.6, 0.8, 1.0))
-		"plant":
-			if float(it["grow"]) < 1.0:
-				_toast("Still growing (%d%%)" % int(float(it["grow"]) * 100.0))
-				return
-			var n := 1 + (1 if rng.randf() < 0.4 else 0)
-			if _inv_add("greens", n):
-				it["grow"] = 0.0
-				total_harvest += 1
-				_daily_progress("harvest")
-				_award_xp(8)
-				_fx_burst(Vector3(player_pos.x, 1.0, player_pos.z), Color(0.4, 1.0, 0.4))
-				_toast("Harvested +%d Fresh Greens" % n, 2.4, Color(0.5, 1.0, 0.5))
-				_check_achievements()
-		"crate":
-			_open_crate(it)
-
-
-func _open_crate(it: Dictionary) -> void:
-	if bool(it["falling"]):
-		_toast("Wait for it to land!")
-		return
-	var rar := int(it["rarity"])
-	var loot: Dictionary = it["fixed"]
-	var is_welcome := not loot.is_empty()
-	if loot.is_empty():
-		loot = _loot_for(rar)
-	var parts := PackedStringArray()
-	for k in loot.keys():
-		var id: String = k
-		var n := int(loot[k])
-		if id == "xp":
-			_award_xp(n, false)
-			parts.append("+%d XP" % n)
-		elif _inv_add(id, n):
-			parts.append("+%d %s" % [n, ITEMS[id]["name"]])
-	var node: Node3D = it["node"]
-	_fx_burst(node.position + Vector3(0, 1, 0), RARITY_COLORS[rar])
-	_toast("%s CRATE:  %s" % [RARITY_NAMES[rar].to_upper(), ", ".join(parts)], 4.0, RARITY_COLORS[rar])
-	_award_xp(30 * (rar + 1))
-	if rar >= 2:
-		_flash(RARITY_COLORS[rar], 0.3)
-		shake = maxf(shake, 0.4)
-	if rar == 3:
-		_unlock("legendary")
-	if is_welcome:
-		tut_flags["crate"] = true
-	else:
-		_daily_progress("drops")
-	node.queue_free()
-	_remove_interact(it)
-
-
-func _start_sleep() -> void:
-	if sleeping or driving:
-		return
-	sleeping = true
-	sleep_timer = SLEEP_TIME
-	sleep_rest_from = rest
-	rover_speed = 0.0
-	sleep_label.text = ["Sweet dreams, Space Explorer…", "Resting in crew quarters…", "Sleep cycle in progress…", "Rest cycle: restoring crew performance…"][bracket]
-
-
-func _process_sleep(delta: float) -> void:
-	if not sleeping:
-		sleep_overlay.visible = false
-		return
-	sleep_timer -= delta
-	var p := clampf(1.0 - sleep_timer / SLEEP_TIME, 0.0, 1.0)
-	rest = lerpf(sleep_rest_from, 100.0, p)
-	food = maxf(0.0, food - (8.0 / SLEEP_TIME) * delta)
-	sleep_overlay.visible = true
-	sleep_overlay.color.a = sin(PI * p) * 0.92
-	sleep_label.modulate.a = sin(PI * p)
-	if sleep_timer <= 0.0:
-		sleeping = false
-		rest = 100.0
-		sleep_overlay.visible = false
-		tut_flags["sleep"] = true
-		_toast("Fully rested — Rest 100%", 2.6, Color(0.6, 0.8, 1.0))
-
-
-func _toggle_rover() -> void:
-	if state != SimState.SURFACE or sleeping or ui_modal != "":
-		return
-	if driving:
-		driving = false
-		rover_speed = 0.0
-		var side := Basis(Vector3.UP, rover_heading) * Vector3.RIGHT
-		player_pos = _clamp_world(_resolve_obstacles(rover.position + side * 3.2, 0.6))
-		player_pos.y = PLAYER_Y
-		cam_yaw = player_heading
-		_toast("Exited rover")
-	else:
-		var d := Vector2(player_pos.x - rover.position.x, player_pos.z - rover.position.z).length()
-		if d <= 7.0:
-			driving = true
-			rover_speed = 0.0
-			cam_yaw = rover_heading
-			_toast("Rover engaged — WASD to drive, R to exit")
-		else:
-			_toast("Rover is %d m away — walk closer, then press R" % int(d))
-
-
-func _on_reset_spawn() -> void:
-	if state != SimState.SURFACE:
-		return
-	driving = false
-	rover_speed = 0.0
-	sleeping = false
-	sleep_overlay.visible = false
-	player_pos = SPAWN_POS
-	player_heading = 0.0
-	cam_yaw = 0.0
-	cam_target = player_pos
-	_toast("Returned to landing pad")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  FX / FEEDBACK / COSMETICS
-# ═══════════════════════════════════════════════════════════════════════════
-func _fx_burst(pos: Vector3, col: Color) -> void:
-	if not q_particles:
-		return
-	burst_fx.global_position = pos
-	burst_fx.color = col
-	burst_fx.restart()
-	burst_fx.emitting = true
-
-
-func _flash(col: Color, strength: float) -> void:
-	if flash_rect == null:
-		return
-	flash_rect.color = Color(col.r, col.g, col.b, strength)
-	create_tween().tween_property(flash_rect, "color:a", 0.0, 0.6)
-
-
-func _toast(msg: String, dur := 2.6, col := Color(1, 0.95, 0.85)) -> void:
-	if toast_label == null:
-		return
-	toast_label.text = msg
-	toast_label.add_theme_color_override("font_color", col)
-	toast_time = dur
-	toast_label.modulate.a = 1.0
-	toast_label.visible = true
-	toast_label.scale = Vector2(1.08, 1.08)
-	create_tween().tween_property(toast_label, "scale", Vector2.ONE, 0.25)
-
-
-func _update_toast(delta: float) -> void:
-	if toast_time > 0.0:
-		toast_time -= delta
-		toast_label.modulate.a = clampf(toast_time / 0.6, 0.0, 1.0)
-		if toast_time <= 0.0:
-			toast_label.visible = false
-
-
-func _apply_customization() -> void:
-	suit_idx = clampi(suit_idx, 0, PALETTE.size() - 1)
-	accent_idx = clampi(accent_idx, 0, PALETTE.size() - 1)
-	rover_idx = clampi(rover_idx, 0, PALETTE.size() - 1)
-	visor_idx = clampi(visor_idx, 0, VISORS.size() - 1)
-	var sc: Color = PALETTE[suit_idx]["col"]
-	var vc: Color = VISORS[visor_idx]["col"]
-	var ac: Color = PALETTE[accent_idx]["col"]
-	var rc: Color = PALETTE[rover_idx]["col"]
-	suit_mat.albedo_color = sc
-	visor_mat.albedo_color = vc
-	visor_mat.emission = vc * 0.6
-	accent_mat.albedo_color = ac
-	accent_mat.emission = ac
-	rover_paint_mat.albedo_color = rc
-	callsign_label.text = callsign
-
-
-func _set_cosmetic(cat: String, i: int) -> void:
-	match cat:
-		"suit":
-			suit_idx = i
-		"visor":
-			visor_idx = i
-		"accent":
-			accent_idx = i
-		"rover":
-			rover_idx = i
-	_apply_customization()
-	_save()
-	_open_modal("custom", false)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  UI HELPERS
-# ═══════════════════════════════════════════════════════════════════════════
-func _style(bg: Color, border := Color(0, 0, 0, 0), radius := 12, bw := 0, margin := 14) -> StyleBoxFlat:
-	var s := StyleBoxFlat.new()
-	s.bg_color = bg
-	s.border_color = border
-	s.set_corner_radius_all(radius)
-	s.set_border_width_all(bw)
-	s.set_content_margin_all(margin)
-	s.shadow_color = Color(0, 0, 0, 0.35)
-	s.shadow_size = 6
-	return s
-
-
-func _panel_style() -> StyleBoxFlat:
-	return _style(Color(0.05, 0.02, 0.03, 0.8), Color(0.95, 0.4, 0.2, 0.8), 14, 2, 12)
-
-
-func _lbl(text: String, size := 16, color := Color.WHITE) -> Label:
-	var l := Label.new()
-	l.text = text
-	l.add_theme_font_size_override("font_size", size)
-	l.add_theme_color_override("font_color", color)
-	return l
-
-
-func _outlined(l: Label, w := 6) -> Label:
-	l.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.9))
-	l.add_theme_constant_override("outline_size", w)
-	return l
-
-
-func _style_button(b: Button, base: Color, size := 16) -> void:
-	b.add_theme_font_size_override("font_size", size)
-	for k in ["font_color", "font_hover_color", "font_pressed_color", "font_focus_color"]:
-		b.add_theme_color_override(k, Color.WHITE)
-	b.add_theme_color_override("font_disabled_color", Color(1, 1, 1, 0.45))
-	b.add_theme_stylebox_override("normal", _style(base, base.lightened(0.3), 10, 2, 8))
-	b.add_theme_stylebox_override("hover", _style(base.lightened(0.15), Color.WHITE, 10, 2, 8))
-	b.add_theme_stylebox_override("pressed", _style(base.darkened(0.2), Color.WHITE, 10, 2, 8))
-	b.add_theme_stylebox_override("disabled", _style(base.darkened(0.55), Color(1, 1, 1, 0.1), 10, 1, 8))
-	b.add_theme_stylebox_override("focus", _style(Color(0, 0, 0, 0), Color(1, 1, 1, 0.9), 10, 2, 8))
-
-
-func _button(text: String, col: Color, cb: Callable, size := 15, min_size := Vector2(0, 40)) -> Button:
-	var b := Button.new()
-	b.text = text
-	b.focus_mode = Control.FOCUS_NONE
-	b.custom_minimum_size = min_size
-	_style_button(b, col, size)
-	b.pressed.connect(cb)
-	return b
-
-
-func _bar(color: Color, h := 20) -> ProgressBar:
-	var bar := ProgressBar.new()
-	bar.max_value = 100.0
-	bar.value = 100.0
-	bar.custom_minimum_size = Vector2(120, h)
-	bar.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	bar.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	bar.add_theme_font_size_override("font_size", 12)
-	bar.add_theme_stylebox_override("fill", _style(color, Color(0, 0, 0, 0), 6, 0, 0))
-	bar.add_theme_stylebox_override("background", _style(Color(0.12, 0.08, 0.08, 0.9), Color(1, 1, 1, 0.15), 6, 1, 0))
-	return bar
-
-
-func _bar_row(parent: Control, text: String, color: Color) -> ProgressBar:
-	var row := HBoxContainer.new()
-	row.add_theme_constant_override("separation", 8)
-	var l := _lbl(text, 15, Color(0.92, 0.86, 0.82))
-	l.custom_minimum_size = Vector2(60, 0)
-	row.add_child(l)
-	var bar := _bar(color)
-	row.add_child(bar)
-	parent.add_child(row)
-	return bar
-
-
-func _wrap(l: Label, w: float) -> Label:
-	l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	l.custom_minimum_size = Vector2(w, 0)
-	return l
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  MENU UI
-# ═══════════════════════════════════════════════════════════════════════════
-func _build_menu_ui() -> void:
-	menu_layer = CanvasLayer.new()
-	menu_layer.layer = 10
-	add_child(menu_layer)
-	var root := Control.new()
-	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	menu_layer.add_child(root)
-
-	menu_panel = PanelContainer.new()
-	menu_panel.anchor_bottom = 1.0
-	menu_panel.offset_left = 36.0
-	menu_panel.offset_right = 500.0
-	menu_panel.offset_top = 24.0
-	menu_panel.offset_bottom = -24.0
-	menu_panel.add_theme_stylebox_override("panel", _style(Color(0.05, 0.02, 0.03, 0.86), Color(0.95, 0.4, 0.2, 0.85), 18, 2, 20))
-	menu_panel.modulate.a = 0.0
-	root.add_child(menu_panel)
-	var scroll := ScrollContainer.new()
-	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	menu_panel.add_child(scroll)
-	var vb := VBoxContainer.new()
-	vb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	vb.add_theme_constant_override("separation", 9)
-	scroll.add_child(vb)
-
-	vb.add_child(_lbl("ARES PROGRAM  •  GALE CRATER EXPEDITION", 13, Color(0.98, 0.55, 0.3)))
-	var title := _lbl("MARS SIMULATOR", 40)
-	title.add_theme_color_override("font_outline_color", Color(0.9, 0.25, 0.1))
-	title.add_theme_constant_override("outline_size", 3)
-	vb.add_child(title)
-	vb.add_child(_lbl("MASTER EDITION II", 18, Color(0.98, 0.55, 0.3)))
-	vb.add_child(HSeparator.new())
-
-	var badge := PanelContainer.new()
-	badge.add_theme_stylebox_override("panel", _style(Color(0.95, 0.5, 0.1, 0.22), Color(1.0, 0.65, 0.2), 20, 2, 8))
-	badge.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
-	streak_badge = _lbl("", 16, Color(1.0, 0.82, 0.45))
-	badge.add_child(streak_badge)
-	vb.add_child(badge)
-	profile_label = _wrap(_lbl("", 13, Color(0.85, 0.8, 0.78)), 400)
-	vb.add_child(profile_label)
-
-	vb.add_child(_lbl("MISSION BRIEFING", 14, Color(0.98, 0.55, 0.3)))
-	vb.add_child(_wrap(_lbl(
-		"• Drop from orbit in the ARES-7 capsule and land beside Base Alpha.\n" +
-		"• Mine glowing deposits, open supply drops, grow food and craft gear.\n" +
-		"• Recover every Isotope Gem (green beams) to finish each expedition.\n" +
-		"• Keep Power, Food and Rest up — shelter inside during flares.", 14, Color(0.92, 0.88, 0.85)), 400))
-
-	age_label = _lbl("", 18)
-	vb.add_child(age_label)
-	age_slider = HSlider.new()
-	age_slider.min_value = 8
-	age_slider.max_value = 60
-	age_slider.step = 1
-	age_slider.custom_minimum_size = Vector2(0, 28)
-	age_slider.value_changed.connect(_on_age_changed)
-	vb.add_child(age_slider)
-	diff_label = _wrap(_lbl("", 14, Color(1.0, 0.75, 0.5)), 400)
-	vb.add_child(diff_label)
-	branch_label = _wrap(_lbl("", 13, Color(0.8, 0.75, 0.72)), 400)
-	vb.add_child(branch_label)
-
-	tut_check = CheckBox.new()
-	tut_check.text = "Play the training tutorial"
-	tut_check.button_pressed = play_tutorial
-	tut_check.add_theme_font_size_override("font_size", 15)
-	tut_check.toggled.connect(func(on: bool): play_tutorial = on)
-	vb.add_child(tut_check)
-
-	launch_btn = Button.new()
-	launch_btn.text = "▲  Launch Mission to Gale Crater"
-	launch_btn.custom_minimum_size = Vector2(0, 60)
-	_style_button(launch_btn, Color(0.82, 0.22, 0.10), 22)
-	launch_btn.pressed.connect(_on_launch_pressed)
-	vb.add_child(launch_btn)
-	vb.add_child(_lbl("Rendering profile: %s  •  %s  •  %d threads" % [q_tier, q_os, q_cores], 12, Color(0.65, 0.6, 0.58)))
-
-	var ev := _outlined(_lbl(EVENT_TEXT, 16, Color(1.0, 0.8, 0.6)))
-	ev.anchor_left = 1.0
-	ev.anchor_right = 1.0
-	ev.offset_left = -560.0
-	ev.offset_right = -32.0
-	ev.offset_top = 26.0
-	ev.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	root.add_child(ev)
-	var hint := _outlined(_lbl("Drag to rotate Mars   •   Scroll to zoom", 14, Color(0.85, 0.8, 0.78)))
-	hint.anchor_right = 1.0
-	hint.anchor_top = 1.0
-	hint.anchor_bottom = 1.0
-	hint.offset_top = -44.0
-	hint.offset_bottom = -12.0
-	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	root.add_child(hint)
-	pin_label = _outlined(_lbl("◉ GALE CRATER\n5.4°S · 137.8°E", 15, Color(1.0, 0.45, 0.35)))
-	pin_label.visible = false
-	root.add_child(pin_label)
-
-
-func _on_age_changed(v: float) -> void:
-	cadet_age = int(v)
-	bracket = _bracket_for(cadet_age)
-	expedition = 1
-	difficulty = _difficulty_for()
-	var b := _br()
-	age_label.text = "Cadet Age:  %d%s" % [cadet_age, "+" if cadet_age >= 60 else ""]
-	diff_label.text = "Path: %s  •  drain ×%.2f  •  %d gems  •  hazards ×%.2f" % [b["name"], difficulty, int(b["gems"]), float(b["hazard"])]
-	branch_label.text = str(b["desc"])
-	_ensure_daily()
-
-
-func _refresh_menu_profile() -> void:
-	streak_badge.text = "★  %d-DAY STREAK   (best %d)" % [streak, best_streak]
-	var reward := "Today's supply bonus ready on landing!" if claimed_day != _today() else "Today's supply bonus claimed — come back tomorrow."
-	profile_label.text = "Level %d  •  %d XP to next  •  %d gems lifetime  •  %d expeditions  •  %d/%d achievements\n%s" % [
-		level, _xp_needed(level) - xp, total_gems, expeditions_done, achievements.size(), ACHIEVEMENTS.size(), reward]
-	tut_check.button_pressed = play_tutorial
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  HUD
-# ═══════════════════════════════════════════════════════════════════════════
-func _anchor(c: Control, al: float, at: float, ar: float, ab: float, ol: float, ot: float, orr: float, ob: float) -> void:
-	c.anchor_left = al
-	c.anchor_top = at
-	c.anchor_right = ar
-	c.anchor_bottom = ab
-	c.offset_left = ol
-	c.offset_top = ot
-	c.offset_right = orr
-	c.offset_bottom = ob
-
-
-func _build_hud() -> void:
-	hud_layer = CanvasLayer.new()
-	hud_layer.layer = 5
-	add_child(hud_layer)
-	hud_root = Control.new()
-	hud_root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	hud_root.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hud_layer.add_child(hud_root)
-
-	var vignette := TextureRect.new()
-	var g := Gradient.new()
-	g.offsets = PackedFloat32Array([0.0, 0.62, 1.0])
-	g.colors = PackedColorArray([Color(0, 0, 0, 0), Color(0, 0, 0, 0.05), Color(0.08, 0.02, 0.0, 0.55)])
-	var gt := GradientTexture2D.new()
-	gt.gradient = g
-	gt.fill = GradientTexture2D.FILL_RADIAL
-	gt.fill_from = Vector2(0.5, 0.5)
-	gt.fill_to = Vector2(1.0, 0.5)
-	vignette.texture = gt
-	vignette.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-	vignette.stretch_mode = TextureRect.STRETCH_SCALE
-	vignette.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	vignette.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hud_root.add_child(vignette)
-
-	# left column: telemetry + training
-	var left := VBoxContainer.new()
-	left.position = Vector2(16, 16)
-	left.custom_minimum_size = Vector2(320, 0)
-	left.add_theme_constant_override("separation", 10)
-	left.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hud_root.add_child(left)
-	var panel := PanelContainer.new()
-	panel.add_theme_stylebox_override("panel", _panel_style())
-	left.add_child(panel)
-	var vb := VBoxContainer.new()
-	vb.add_theme_constant_override("separation", 6)
-	panel.add_child(vb)
-	vb.add_child(_lbl("ARES TELEMETRY", 17, Color(1.0, 0.6, 0.35)))
-	cadet_label = _lbl("", 12, Color(0.75, 0.7, 0.68))
-	vb.add_child(cadet_label)
-	power_bar = _bar_row(vb, "Power", Color(1.0, 0.78, 0.2))
-	food_bar = _bar_row(vb, "Food", Color(0.45, 0.85, 0.35))
-	rest_bar = _bar_row(vb, "Rest", Color(0.4, 0.65, 1.0))
-	hazard_label = _lbl("", 14)
-	vb.add_child(hazard_label)
-	mode_label = _lbl("", 13, Color(0.92, 0.88, 0.85))
-	vb.add_child(mode_label)
-	room_label = _lbl("", 13, Color(0.6, 0.85, 1.0))
-	vb.add_child(room_label)
-	var grid := GridContainer.new()
-	grid.columns = 4
-	grid.add_theme_constant_override("h_separation", 6)
-	vb.add_child(grid)
-	grid.add_child(_button("Bag", Color(0.45, 0.3, 0.15), func(): if ui_modal == "": _open_modal("inventory"), 13, Vector2(68, 32)))
-	grid.add_child(_button("Eat", Color(0.25, 0.5, 0.2), _eat_best, 13, Vector2(68, 32)))
-	grid.add_child(_button("Rover", Color(0.7, 0.35, 0.1), _toggle_rover, 13, Vector2(68, 32)))
-	grid.add_child(_button("Pad", Color(0.4, 0.2, 0.35), _on_reset_spawn, 13, Vector2(68, 32)))
-
-	tut_panel = PanelContainer.new()
-	tut_panel.add_theme_stylebox_override("panel", _style(Color(0.02, 0.06, 0.12, 0.85), Color(0.4, 0.75, 1.0, 0.9), 14, 2, 12))
-	tut_panel.visible = false
-	left.add_child(tut_panel)
-	var tvb := VBoxContainer.new()
-	tvb.add_theme_constant_override("separation", 6)
-	tut_panel.add_child(tvb)
-	tut_title = _lbl("", 14, Color(0.6, 0.85, 1.0))
-	tvb.add_child(tut_title)
-	tut_text = _wrap(_lbl("", 16), 296)
-	tvb.add_child(tut_text)
-	tut_prog = _bar(Color(0.4, 0.75, 1.0), 8)
-	tut_prog.show_percentage = false
-	tvb.add_child(tut_prog)
-	tvb.add_child(_lbl("Backspace — skip training", 11, Color(0.6, 0.65, 0.7)))
-
-	# top centre: level / xp / streak / combo
-	var top := PanelContainer.new()
-	_anchor(top, 0.5, 0.0, 0.5, 0.0, -200.0, 12.0, 200.0, 12.0)
-	top.add_theme_stylebox_override("panel", _panel_style())
-	top.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hud_root.add_child(top)
-	var tv := VBoxContainer.new()
-	tv.add_theme_constant_override("separation", 3)
-	top.add_child(tv)
-	var row := HBoxContainer.new()
-	row.add_theme_constant_override("separation", 10)
-	level_label = _lbl("LV 1", 22, Color(1.0, 0.82, 0.3))
-	row.add_child(level_label)
-	rank_label = _lbl("", 13, Color(0.9, 0.85, 0.8))
-	rank_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	rank_label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	row.add_child(rank_label)
-	streak_label = _lbl("", 14, Color(1.0, 0.65, 0.25))
-	streak_label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	row.add_child(streak_label)
-	tv.add_child(row)
-	xp_bar = _bar(Color(1.0, 0.78, 0.25), 12)
-	xp_bar.show_percentage = false
-	tv.add_child(xp_bar)
-	xp_text = _lbl("", 11, Color(0.85, 0.8, 0.75))
-	xp_text.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	tv.add_child(xp_text)
-	combo_label = _outlined(_lbl("", 20, Color(1.0, 0.45, 0.85)))
-	combo_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	combo_label.visible = false
-	tv.add_child(combo_label)
-
-	# top right: radar, clock, daily missions
-	radar = RadarView.new()
-	radar.game = self
-	_anchor(radar, 1.0, 0.0, 1.0, 0.0, -200.0, 16.0, -16.0, 200.0)
-	radar.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hud_root.add_child(radar)
-	mission_label = _outlined(_lbl("", 15, Color(1.0, 0.85, 0.65)))
-	_anchor(mission_label, 1.0, 0.0, 1.0, 0.0, -460.0, 206.0, -16.0, 230.0)
-	mission_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	hud_root.add_child(mission_label)
-	var dp := PanelContainer.new()
-	_anchor(dp, 1.0, 0.0, 1.0, 0.0, -300.0, 236.0, -16.0, 236.0)
-	dp.add_theme_stylebox_override("panel", _style(Color(0.05, 0.02, 0.03, 0.7), Color(0.5, 1.0, 0.6, 0.6), 12, 1, 10))
-	dp.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hud_root.add_child(dp)
-	daily_label = _wrap(_lbl("", 13, Color(0.85, 1.0, 0.85)), 260)
-	dp.add_child(daily_label)
-
-	toast_label = _outlined(_lbl("", 20), 8)
-	_anchor(toast_label, 0.5, 0.0, 0.5, 0.0, -420.0, 128.0, 420.0, 160.0)
-	toast_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	toast_label.pivot_offset = Vector2(420, 16)
-	toast_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	toast_label.visible = false
-	hud_root.add_child(toast_label)
-
-	# bottom: prompt + hotbar + help
-	prompt_panel = PanelContainer.new()
-	_anchor(prompt_panel, 0.5, 1.0, 0.5, 1.0, -230.0, -176.0, 230.0, -124.0)
-	prompt_panel.add_theme_stylebox_override("panel", _style(Color(0.05, 0.02, 0.03, 0.85), Color(1.0, 0.82, 0.3, 0.9), 12, 2, 10))
-	prompt_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	prompt_panel.visible = false
-	hud_root.add_child(prompt_panel)
-	var pvb := VBoxContainer.new()
-	prompt_panel.add_child(pvb)
-	prompt_label = _lbl("", 18, Color(1.0, 0.9, 0.6))
-	prompt_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	pvb.add_child(prompt_label)
-	mine_bar = _bar(Color(1.0, 0.6, 0.2), 10)
-	mine_bar.max_value = 1.0
-	mine_bar.show_percentage = false
-	pvb.add_child(mine_bar)
-
-	var hot := HBoxContainer.new()
-	_anchor(hot, 0.5, 1.0, 0.5, 1.0, -330.0, -112.0, 330.0, -62.0)
-	hot.alignment = BoxContainer.ALIGNMENT_CENTER
-	hot.add_theme_constant_override("separation", 10)
-	hot.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hud_root.add_child(hot)
-	hot_food = _hot_slot(hot, Color(0.45, 0.85, 0.35))
-	hot_cell = _hot_slot(hot, Color(1.0, 0.85, 0.25))
-	hot_inv = _hot_slot(hot, Color(0.85, 0.65, 0.45))
-
-	var help := _outlined(_lbl("WASD move  •  Shift sprint  •  F interact / hold to mine  •  I bag  •  E eat  •  Q cell  •  R rover  •  H pad  •  Esc pause", 12, Color(0.9, 0.85, 0.8)))
-	_anchor(help, 0.0, 1.0, 1.0, 1.0, 0.0, -30.0, 0.0, -8.0)
-	help.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	hud_root.add_child(help)
-
-	fact_panel = PanelContainer.new()
-	_anchor(fact_panel, 0.0, 1.0, 0.0, 1.0, 16.0, -230.0, 376.0, -150.0)
-	fact_panel.add_theme_stylebox_override("panel", _style(Color(0.08, 0.03, 0.12, 0.85), Color(0.8, 0.5, 1.0, 0.8), 12, 2, 10))
-	fact_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	fact_panel.visible = false
-	hud_root.add_child(fact_panel)
-	fact_label = _wrap(_lbl("", 14, Color(0.95, 0.9, 1.0)), 340)
-	fact_panel.add_child(fact_label)
-
-	flash_rect = ColorRect.new()
-	flash_rect.color = Color(0, 0, 0, 0)
-	flash_rect.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	flash_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hud_root.add_child(flash_rect)
-
-	sleep_overlay = ColorRect.new()
-	sleep_overlay.color = Color(0, 0, 0, 0)
-	sleep_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	sleep_overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	sleep_overlay.visible = false
-	hud_root.add_child(sleep_overlay)
-	sleep_label = _lbl("", 30, Color(0.85, 0.9, 1.0))
-	sleep_label.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	sleep_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	sleep_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	sleep_overlay.add_child(sleep_label)
-
-
-func _hot_slot(parent: Control, col: Color) -> Label:
-	var p := PanelContainer.new()
-	p.add_theme_stylebox_override("panel", _style(Color(0.05, 0.02, 0.03, 0.8), col, 10, 2, 8))
-	p.custom_minimum_size = Vector2(190, 0)
-	p.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	parent.add_child(p)
-	var l := _lbl("", 14, col.lightened(0.3))
-	l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	p.add_child(l)
-	return l
-
-
-func _build_intro_overlay() -> void:
-	intro_layer = CanvasLayer.new()
-	intro_layer.layer = 6
-	add_child(intro_layer)
-	var root := Control.new()
-	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	intro_layer.add_child(root)
-	letter_top = ColorRect.new()
-	letter_top.color = Color.BLACK
-	_anchor(letter_top, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 90.0)
-	root.add_child(letter_top)
-	letter_bot = ColorRect.new()
-	letter_bot.color = Color.BLACK
-	_anchor(letter_bot, 0.0, 1.0, 1.0, 1.0, 0.0, -90.0, 0.0, 0.0)
-	root.add_child(letter_bot)
-	var t := _lbl("ARES-7   •   ENTRY, DESCENT & LANDING   •   GALE CRATER", 18, Color(1.0, 0.6, 0.35))
-	_anchor(t, 0.0, 0.0, 1.0, 0.0, 0.0, 32.0, 0.0, 60.0)
-	t.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	root.add_child(t)
-	intro_label = _lbl("", 15, Color(0.85, 0.95, 1.0))
-	_anchor(intro_label, 0.0, 1.0, 1.0, 1.0, 40.0, -60.0, -40.0, -30.0)
-	root.add_child(intro_label)
-	var skip := _lbl("SPACE — skip", 14, Color(0.8, 0.75, 0.7))
-	_anchor(skip, 0.0, 1.0, 1.0, 1.0, 40.0, -60.0, -40.0, -30.0)
-	skip.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	root.add_child(skip)
-	intro_msg = _outlined(_lbl("", 34, Color(1.0, 0.85, 0.6)), 10)
-	_anchor(intro_msg, 0.0, 0.5, 1.0, 0.5, 0.0, 120.0, 0.0, 170.0)
-	intro_msg.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	root.add_child(intro_msg)
-	intro_layer.visible = false
-
-
-func _build_fade_layer() -> void:
-	fade_layer = CanvasLayer.new()
-	fade_layer.layer = 50
-	add_child(fade_layer)
-	fade_rect = ColorRect.new()
-	fade_rect.color = Color(0, 0, 0, 1)
-	fade_rect.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	fade_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	fade_layer.add_child(fade_rect)
-
-
-func _update_hud() -> void:
-	power_bar.value = power
-	food_bar.value = food
-	rest_bar.value = rest
-	var pulse := Color(1.0, 0.45 + 0.2 * sin(time_accum * 8.0), 0.45)
-	power_bar.modulate = pulse if power < 25.0 else Color.WHITE
-	food_bar.modulate = pulse if food < 25.0 else Color.WHITE
-	rest_bar.modulate = pulse if rest < 25.0 else Color.WHITE
-	cadet_label.text = "%s  •  %s  •  age %d  •  ×%.2f" % [callsign, _br()["name"], cadet_age, difficulty * ease]
-	match hazard:
-		Hazard.NONE:
-			hazard_label.text = "● CLEAR SKIES"
-			hazard_label.add_theme_color_override("font_color", Color(0.4, 1.0, 0.5))
-		Hazard.DUST_STORM:
-			hazard_label.text = "▲ DUST STORM  (%ds)" % int(hazard_timer)
-			hazard_label.add_theme_color_override("font_color", Color(1.0, 0.65, 0.25))
-		Hazard.SOLAR_FLARE:
-			hazard_label.text = "▲ SOLAR FLARE — GET INSIDE!  (%ds)" % int(hazard_timer)
-			hazard_label.add_theme_color_override("font_color", Color(1.0, 0.3, 0.25))
-	if driving:
-		mode_label.text = "MODE: ROVER  •  %.1f m/s" % absf(rover_speed)
-	elif food <= 0.0 or rest <= 0.0:
-		mode_label.text = "MODE: ON FOOT  •  EXHAUSTED"
-	else:
-		mode_label.text = "MODE: ON FOOT  •  drill Lv %d" % drill_level
-	var room := ""
-	for r in rooms:
-		var rr: Rect2 = r["rect"]
-		if rr.has_point(Vector2(player_pos.x, player_pos.z)):
-			room = r["name"]
-	if room != "":
-		room_label.text = "LOCATION: %s  (shelter • recharging)" % room
-	else:
-		var to_base := Vector2(HAB_POS.x - player_pos.x, HAB_POS.z + 9.0 - player_pos.z)
-		var right := Vector2(cos(cam_yaw), -sin(cam_yaw))
-		var fwd := Vector2(-sin(cam_yaw), -cos(cam_yaw))
-		var ang := atan2(to_base.dot(right), to_base.dot(fwd))
-		var arrows := ["↑", "↗", "→", "↘", "↓", "↙", "←", "↖"]
-		room_label.text = "OUTSIDE  •  BASE %s %d m" % [arrows[wrapi(int(roundf(ang / (PI / 4.0))), 0, 8)], int(_dist_to_base(player_pos))]
-	level_label.text = "LV %d" % level
-	rank_label.text = str(_br()["name"]).to_upper()
-	streak_label.text = "★ %d-DAY" % streak
-	xp_bar.max_value = _xp_needed(level)
-	xp_bar.value = xp
-	xp_text.text = "%d / %d XP" % [xp, _xp_needed(level)]
-	combo_label.visible = combo > 1
-	if combo > 1:
-		combo_label.text = "COMBO ×%.2f   (%ds)" % [1.0 + 0.25 * float(mini(combo, 9) - 1), ceili(combo_timer)]
-	var m := floori(mission_time / 60.0)
-	var s := int(mission_time) % 60
-	mission_label.text = "MET %02d:%02d  •  EXPEDITION %d  •  GEMS %d/%d%s" % [m, s, expedition, gems, gem_target, "  ★" if mission_complete else ""]
-	var lines := PackedStringArray(["DAILY MISSIONS"])
-	for d in daily:
-		var dd: Dictionary = d
-		lines.append("%s %s  (%d/%d)" % ["✓" if bool(dd["done"]) else "·", dd["text"], mini(int(dd["prog"]), int(dd["goal"])), int(dd["goal"])])
-	daily_label.text = "\n".join(lines)
-	var food_n := _inv_count("ration") + _inv_count("greens") + _inv_count("energy_bar")
-	hot_food.text = "[E]  Food  ×%d" % food_n
-	hot_cell.text = "[Q]  Power Cell  ×%d" % _inv_count("power_cell")
-	hot_inv.text = "[I]  Bag  %d / %d" % [inventory.size(), INV_SLOTS]
-	var show_prompt := ui_modal == "" and not sleeping and (driving or not focus.is_empty())
-	prompt_panel.visible = show_prompt
-	if show_prompt:
-		var is_hold := not driving and bool(focus.get("hold", false))
-		mine_bar.visible = is_hold
-		mine_bar.value = mine_progress
-		if driving:
-			prompt_label.text = "[R]  Exit rover"
-		elif str(focus["act"]) == "rover":
-			prompt_label.text = "[R / F]  Board ARES rover"
-		elif is_hold:
-			prompt_label.text = "[Hold F]  %s   (%d left)" % [focus["label"], int(focus["hp"])]
-		else:
-			var cd := float(focus.get("cd", 0.0)) - time_accum
-			prompt_label.text = "[F]  %s%s" % [focus["label"], "   (ready in %ds)" % ceili(cd) if cd > 0.0 else ""]
-	radar.queue_redraw()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  MODAL WINDOWS (inventory, crafting, customisation, terminal, pause …)
-# ═══════════════════════════════════════════════════════════════════════════
-func _build_modal() -> void:
-	modal_layer = CanvasLayer.new()
-	modal_layer.layer = 20
-	add_child(modal_layer)
-	modal_dim = ColorRect.new()
-	modal_dim.color = Color(0, 0, 0, 0.55)
-	modal_dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	modal_dim.visible = false
-	modal_layer.add_child(modal_dim)
-	modal_panel = PanelContainer.new()
-	_anchor(modal_panel, 0.5, 0.5, 0.5, 0.5, -340.0, -260.0, 340.0, 260.0)
-	modal_panel.add_theme_stylebox_override("panel", _style(Color(0.06, 0.03, 0.04, 0.96), Color(0.95, 0.45, 0.2, 0.95), 18, 2, 18))
-	modal_dim.add_child(modal_panel)
-	var vb := VBoxContainer.new()
-	vb.add_theme_constant_override("separation", 10)
-	modal_panel.add_child(vb)
-	var head := HBoxContainer.new()
-	modal_title = _lbl("", 22, Color(1.0, 0.65, 0.35))
-	modal_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	head.add_child(modal_title)
-	modal_close = _button("✕  Close (Esc)", Color(0.35, 0.2, 0.2), _close_modal, 14, Vector2(130, 34))
-	head.add_child(modal_close)
-	vb.add_child(head)
-	vb.add_child(HSeparator.new())
-	var scroll := ScrollContainer.new()
-	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	vb.add_child(scroll)
-	modal_body = VBoxContainer.new()
-	modal_body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	modal_body.add_theme_constant_override("separation", 10)
-	scroll.add_child(modal_body)
-
-
-func _open_modal(kind: String, animate := true) -> void:
-	if state != SimState.SURFACE:
-		return
-	ui_modal = kind
-	modal_dim.visible = true
-	for ch in modal_body.get_children():
-		ch.queue_free()
-	modal_close.visible = kind != "summary"
-	match kind:
-		"inventory":
-			modal_title.text = "INVENTORY"
-			tut_flags["inventory"] = true
-			_fill_inventory()
-		"craft":
-			modal_title.text = "FABRICATOR"
-			_fill_craft()
-		"custom":
-			modal_title.text = "LOCKER — CUSTOMISE"
-			_fill_custom()
-		"terminal":
-			modal_title.text = "MISSION CONTROL"
-			_fill_terminal()
-		"pause":
-			modal_title.text = "PAUSED"
-			_fill_pause()
-		"summary":
-			modal_title.text = "EXPEDITION %d COMPLETE" % expedition
-			_fill_summary()
-		"break":
-			modal_title.text = "TIME FOR A BREAK?"
-			_fill_break()
-	if animate:
-		modal_panel.modulate.a = 0.0
-		create_tween().tween_property(modal_panel, "modulate:a", 1.0, 0.15)
-
-
-func _close_modal() -> void:
-	if ui_modal == "custom":
-		_save()
-	ui_modal = ""
-	if modal_dim != null:
-		modal_dim.visible = false
-
-
-func _fill_inventory() -> void:
-	modal_body.add_child(_lbl("Slots %d / %d  •  click an item to use it  •  hover for details" % [inventory.size(), INV_SLOTS], 14, Color(0.85, 0.8, 0.78)))
-	var grid := GridContainer.new()
-	grid.columns = 5
-	grid.add_theme_constant_override("h_separation", 8)
-	grid.add_theme_constant_override("v_separation", 8)
-	modal_body.add_child(grid)
-	var order := {"food": 0, "tool": 1, "material": 2}
-	var ids: Array = inventory.keys()
-	ids.sort_custom(func(a, b): return int(order[ITEMS[a]["cat"]]) < int(order[ITEMS[b]["cat"]]))
-	for id in ids:
-		var info: Dictionary = ITEMS[id]
-		var col: Color = info["col"]
-		var item_id: String = id
-		var b := _button("%s\n×%d" % [info["name"], _inv_count(item_id)], col.darkened(0.55), func(): _use_item(item_id), 13, Vector2(118, 72))
-		b.tooltip_text = "%s  [%s]" % [info["desc"], info["cat"]]
-		grid.add_child(b)
-	for i in INV_SLOTS - ids.size():
-		var e := Panel.new()
-		e.custom_minimum_size = Vector2(118, 72)
-		e.add_theme_stylebox_override("panel", _style(Color(0.1, 0.07, 0.07, 0.8), Color(1, 1, 1, 0.08), 10, 1, 0))
-		grid.add_child(e)
-	modal_body.add_child(_wrap(_lbl("Food restores Food/Rest • Power Cells restore Power (Q) • Materials are crafted at the Workshop Fabricator • Gems count toward your expedition.", 12, Color(0.7, 0.66, 0.64)), 620))
-
-
-func _fill_craft() -> void:
-	modal_body.add_child(_lbl("Drill level %d / 3  •  mining speed ×%.2f" % [drill_level, 0.75 + 0.35 * float(drill_level)], 15, Color(0.8, 0.65, 1.0)))
-	for r in RECIPES:
-		var rd: Dictionary = r
-		var cost: Dictionary = rd["cost"]
-		var row := HBoxContainer.new()
-		row.add_theme_constant_override("separation", 12)
-		var nm := _lbl(str(rd["name"]), 17)
-		nm.custom_minimum_size = Vector2(170, 0)
-		row.add_child(nm)
-		var parts := PackedStringArray()
-		for k in cost.keys():
-			parts.append("%s %d/%d" % [ITEMS[k]["name"], _inv_count(str(k)), int(cost[k])])
-		var cl := _lbl(", ".join(parts), 13, Color(0.6, 1.0, 0.6) if _can_afford(cost) else Color(1.0, 0.6, 0.5))
-		cl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		cl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		row.add_child(cl)
-		var b := _button("Craft", Color(0.8, 0.45, 0.12), func(): _craft(rd), 15, Vector2(90, 38))
-		b.disabled = not _can_afford(cost) or (str(rd["id"]) == "drill" and drill_level >= 3)
-		row.add_child(b)
-		modal_body.add_child(row)
-
-
-func _fill_custom() -> void:
-	var row := HBoxContainer.new()
-	row.add_child(_lbl("Callsign:", 16))
-	var le := LineEdit.new()
-	le.text = callsign
-	le.max_length = 12
-	le.custom_minimum_size = Vector2(220, 34)
-	le.text_changed.connect(func(t: String):
-		callsign = t.strip_edges().to_upper() if t.strip_edges() != "" else "CADET"
-		callsign_label.text = callsign)
-	row.add_child(le)
-	modal_body.add_child(row)
-	_swatch_row("SUIT", PALETTE, "suit", suit_idx)
-	_swatch_row("VISOR", VISORS, "visor", visor_idx)
-	_swatch_row("ACCENTS", PALETTE, "accent", accent_idx)
-	_swatch_row("ROVER PAINT", PALETTE, "rover", rover_idx)
-	modal_body.add_child(_lbl("Level up and keep your daily streak to unlock more colours.", 12, Color(0.7, 0.66, 0.64)))
-
-
-func _swatch_row(title: String, list: Array, cat: String, cur: int) -> void:
-	modal_body.add_child(_lbl(title, 15, Color(1.0, 0.65, 0.35)))
-	var flow := HFlowContainer.new()
-	flow.add_theme_constant_override("h_separation", 6)
-	flow.add_theme_constant_override("v_separation", 6)
-	modal_body.add_child(flow)
-	for i in list.size():
-		var e: Dictionary = list[i]
-		var ok := _is_unlocked(e)
-		var col: Color = e["col"]
-		var txt: String = e["name"] if ok else ("Lv %d" % int(e["lvl"]) if int(e["streak"]) == 0 else "%d-day streak" % int(e["streak"]))
-		var b := _button(txt, col.darkened(0.25 if ok else 0.7), func(): _set_cosmetic(cat, i), 12, Vector2(100, 40))
-		b.add_theme_color_override("font_outline_color", Color.BLACK)
-		b.add_theme_constant_override("outline_size", 4)
-		if i == cur:
-			b.add_theme_stylebox_override("normal", _style(col.darkened(0.25), Color.WHITE, 10, 3, 8))
-		b.disabled = not ok
-		flow.add_child(b)
-
-
-func _fill_terminal() -> void:
-	modal_body.add_child(_wrap(_lbl("Commander %s  •  Level %d (%d / %d XP)  •  %d-day streak (best %d)\nGems %d  •  Mined %d  •  Harvested %d  •  Crafted %d  •  Driven %.1f km  •  Expeditions %d" % [
-		callsign, level, xp, _xp_needed(level), streak, best_streak, total_gems, total_mined, total_harvest, total_crafted, total_drive / 1000.0, expeditions_done], 14), 620))
-	modal_body.add_child(_lbl("DAILY MISSIONS  (reset at midnight UTC)", 16, Color(0.5, 1.0, 0.6)))
-	for d in daily:
-		var dd: Dictionary = d
-		var row := HBoxContainer.new()
-		var l := _lbl(("✓ " if bool(dd["done"]) else "· ") + str(dd["text"]), 14)
-		l.custom_minimum_size = Vector2(300, 0)
-		row.add_child(l)
-		var pb := _bar(Color(0.5, 1.0, 0.6), 14)
-		pb.max_value = float(dd["goal"])
-		pb.value = minf(float(dd["prog"]), float(dd["goal"]))
-		pb.show_percentage = false
-		row.add_child(pb)
-		modal_body.add_child(row)
-	modal_body.add_child(_lbl("ACHIEVEMENTS  %d / %d" % [achievements.size(), ACHIEVEMENTS.size()], 16, Color(1.0, 0.75, 0.3)))
-	var grid := GridContainer.new()
-	grid.columns = 2
-	grid.add_theme_constant_override("h_separation", 24)
-	modal_body.add_child(grid)
-	for k in ACHIEVEMENTS.keys():
-		var a: Array = ACHIEVEMENTS[k]
-		var got: bool = k in achievements
-		grid.add_child(_lbl(("★ " if got else "☆ ") + "%s — %s" % [a[0], a[1]], 13, Color(1.0, 0.85, 0.4) if got else Color(0.55, 0.5, 0.5)))
-
-
-func _fill_pause() -> void:
-	modal_body.add_child(_button("▶  Resume", Color(0.25, 0.5, 0.2), _close_modal, 18, Vector2(0, 48)))
-	modal_body.add_child(_button("Mission Control (stats, dailies, achievements)", Color(0.2, 0.35, 0.6), func(): _open_modal("terminal"), 16, Vector2(0, 44)))
-	modal_body.add_child(_button("Replay training tutorial", Color(0.25, 0.45, 0.6), func():
-		_close_modal()
-		_start_tutorial(), 16, Vector2(0, 44)))
-	modal_body.add_child(_button("Return to orbit (main menu)", Color(0.6, 0.2, 0.15), _return_to_menu, 16, Vector2(0, 44)))
-	modal_body.add_child(_wrap(_lbl("Progress, streak and cosmetics are saved automatically.", 12, Color(0.7, 0.66, 0.64)), 600))
-
-
-func _fill_summary() -> void:
-	var m := floori(mission_time / 60.0)
-	var s := int(mission_time) % 60
-	modal_body.add_child(_wrap(_lbl("All %d Isotope Gems recovered in %02d:%02d.\n\nRewards: +300 XP, +2 Titanium\nLevel %d  •  %d-day streak  •  %d expeditions completed" % [gem_target, m, s, level, streak, expeditions_done], 17), 600))
-	modal_body.add_child(_button("▲  Start Expedition %d  (more gems, tougher conditions)" % (expedition + 1), Color(0.25, 0.55, 0.25), _next_expedition, 17, Vector2(0, 52)))
-	modal_body.add_child(_button("Keep exploring this area", Color(0.3, 0.3, 0.45), _close_modal, 15, Vector2(0, 42)))
-	modal_body.add_child(_button("Return to orbit", Color(0.6, 0.2, 0.15), _return_to_menu, 15, Vector2(0, 42)))
-
-
-func _fill_break() -> void:
-	var mins := int(_br()["break_min"])
-	var msgs := [
-		"You've been exploring for %d minutes, Space Explorer! Great time to stretch, drink some water and rest your eyes." % mins,
-		"%d minutes on Mars! Astronauts take breaks too — stretch, grab some water, look at something far away." % mins,
-		"%d-minute check-in: a short break helps you stay sharp. Your streak and progress are saved." % mins,
-		"Session check-in.",
+		m.emission = c
+		m.emission_energy_multiplier = energy
+		_mats[key] = m
+		return m
+
+	static func unshaded(c: Color, alpha := 1.0, additive := false, no_depth := false) -> StandardMaterial3D:
+		var key := "u%s_%.2f_%s_%s" % [c.to_html(), alpha, additive, no_depth]
+		if _mats.has(key):
+			return _mats[key]
+		var m := StandardMaterial3D.new()
+		m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		m.albedo_color = Color(c.r, c.g, c.b, alpha)
+		m.cull_mode = BaseMaterial3D.CULL_DISABLED
+		if alpha < 1.0 or additive:
+			m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		if additive:
+			m.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+		if no_depth:
+			m.no_depth_test = true
+		_mats[key] = m
+		return m
+
+	static func glass() -> StandardMaterial3D:
+		if _mats.has("glass"):
+			return _mats["glass"]
+		var m := StandardMaterial3D.new()
+		m.albedo_color = Color(0.8, 0.93, 1.0, 0.22)
+		m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		m.roughness = 0.05
+		m.metallic = 0.3
+		m.cull_mode = BaseMaterial3D.CULL_DISABLED
+		_mats["glass"] = m
+		return m
+
+	static func mi(parent: Node, mesh: Mesh, m: Material, pos := Vector3.ZERO) -> MeshInstance3D:
+		var n := MeshInstance3D.new()
+		n.mesh = mesh
+		n.material_override = m
+		n.position = pos
+		if parent:
+			parent.add_child(n)
+		return n
+
+	static func box(parent: Node, size: Vector3, m: Material, pos := Vector3.ZERO) -> MeshInstance3D:
+		var b := BoxMesh.new()
+		b.size = size
+		return mi(parent, b, m, pos)
+
+	static func cyl(parent: Node, rt: float, rb: float, h: float, m: Material, pos := Vector3.ZERO, segs := 16) -> MeshInstance3D:
+		var c := CylinderMesh.new()
+		c.top_radius = rt
+		c.bottom_radius = rb
+		c.height = h
+		c.radial_segments = segs
+		c.rings = 1
+		return mi(parent, c, m, pos)
+
+	static func sphere(parent: Node, r: float, m: Material, pos := Vector3.ZERO, segs := 16, hemi := false) -> MeshInstance3D:
+		var s := SphereMesh.new()
+		s.radius = r
+		s.height = r if hemi else r * 2.0
+		s.is_hemisphere = hemi
+		s.radial_segments = segs
+		s.rings = max(4, segs / 2)
+		return mi(parent, s, m, pos)
+
+	## Torus lying flat (ring around the Y axis).
+	static func torus(parent: Node, r: float, thick: float, m: Material, pos := Vector3.ZERO) -> MeshInstance3D:
+		var t := TorusMesh.new()
+		t.inner_radius = r - thick
+		t.outer_radius = r + thick
+		t.rings = 48
+		t.ring_segments = 8
+		return mi(parent, t, m, pos)
+
+	static func label(parent: Node, text: String, pos: Vector3, size := 64, color := Color.WHITE, pixel := 0.012, billboard := true) -> Label3D:
+		var l := Label3D.new()
+		l.text = text
+		l.font_size = size
+		l.pixel_size = pixel
+		l.position = pos
+		l.modulate = color
+		l.outline_size = 14
+		l.outline_modulate = Color(0.05, 0.03, 0.08, 0.9)
+		if billboard:
+			l.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+		l.double_sided = true
+		if parent:
+			parent.add_child(l)
+		return l
+
+	## Flat octahedron (used for gems).
+	static func octa_mesh(r: float) -> ArrayMesh:
+		var v := [Vector3(r, 0, 0), Vector3(-r, 0, 0), Vector3(0, r * 1.2, 0), Vector3(0, -r * 1.2, 0), Vector3(0, 0, r), Vector3(0, 0, -r)]
+		var faces := [[2, 4, 0], [2, 1, 4], [2, 5, 1], [2, 0, 5], [3, 0, 4], [3, 4, 1], [3, 1, 5], [3, 5, 0]]
+		var st := SurfaceTool.new()
+		st.begin(Mesh.PRIMITIVE_TRIANGLES)
+		for f in faces:
+			for i in f:
+				st.add_vertex(v[i])
+		st.generate_normals()
+		return st.commit()
+
+	## Half cylinder (top half) along Z, with end caps. Used for greenhouses.
+	static func half_cyl_mesh(r: float, length: float, segs := 28) -> ArrayMesh:
+		var st := SurfaceTool.new()
+		st.begin(Mesh.PRIMITIVE_TRIANGLES)
+		var hz := length / 2.0
+		for i in segs:
+			var a0 := PI * float(i) / segs
+			var a1 := PI * float(i + 1) / segs
+			var p0 := Vector3(cos(a0) * r, sin(a0) * r, 0)
+			var p1 := Vector3(cos(a1) * r, sin(a1) * r, 0)
+			var n0 := Vector3(cos(a0), sin(a0), 0)
+			var n1 := Vector3(cos(a1), sin(a1), 0)
+			for q in [[p0, n0, -hz], [p1, n1, -hz], [p1, n1, hz], [p0, n0, -hz], [p1, n1, hz], [p0, n0, hz]]:
+				st.set_normal(q[1])
+				st.add_vertex(q[0] + Vector3(0, 0, q[2]))
+			for z in [-hz, hz]:
+				st.set_normal(Vector3(0, 0, sign(z)))
+				st.add_vertex(Vector3(0, 0, z))
+				st.set_normal(Vector3(0, 0, sign(z)))
+				st.add_vertex(p0 + Vector3(0, 0, z))
+				st.set_normal(Vector3(0, 0, sign(z)))
+				st.add_vertex(p1 + Vector3(0, 0, z))
+		return st.commit()
+
+	## Line loop (circle) in the XZ plane.
+	static func circle_lines(r: float, c: Color, segs := 160) -> MeshInstance3D:
+		var st := SurfaceTool.new()
+		st.begin(Mesh.PRIMITIVE_LINE_STRIP)
+		for i in segs + 1:
+			var a := TAU * float(i) / segs
+			st.add_vertex(Vector3(cos(a) * r, 0, sin(a) * r))
+		var n := MeshInstance3D.new()
+		n.mesh = st.commit()
+		n.material_override = unshaded(c, c.a)
+		return n
+
+	## One-shot particle burst.
+	static func burst(parent: Node, pos: Vector3, c: Color) -> void:
+		var p := CPUParticles3D.new()
+		p.one_shot = true
+		p.explosiveness = 1.0
+		p.amount = 18
+		p.lifetime = 0.9
+		p.direction = Vector3.UP
+		p.spread = 180.0
+		p.initial_velocity_min = 3.0
+		p.initial_velocity_max = 6.0
+		p.gravity = Vector3(0, -3.71, 0)
+		var s := SphereMesh.new()
+		s.radius = 0.08
+		s.height = 0.16
+		s.radial_segments = 6
+		s.rings = 3
+		p.mesh = s
+		p.material_override = unshaded(c, 1.0)
+		p.position = pos
+		parent.add_child(p)
+		p.emitting = true
+		p.get_tree().create_timer(1.6).timeout.connect(p.queue_free)
+
+
+# ======================================================================
+# Static game data: missions, challenges, scenarios and text
+# ======================================================================
+class D extends RefCounted:
+	const MISSIONS := [
+		{"id": "mariner4", "name": "Mariner 4", "years": "1964–1965", "diff": "Easy", "reward": 10, "kind": "Explore",
+		"brief": "The first spacecraft to photograph Mars up close. Recreate its photo pass over craters near the base, then send the pictures home.",
+		"steps": [
+			{"type": "visit", "text": "Photograph the craters", "verb": "Photograph", "points": [[75, 32], [105, 44], [165, 36]], "crater": true, "r": 3.2},
+			{"type": "deliver", "text": "Transmit the photos from Mission Control", "to": "mc"}],
+		"history": {"sub": "First close-up photos of another planet",
+			"dates": [["Nov 28, 1964", "Launched from Cape Kennedy, Florida"], ["Jul 14, 1965", "Started photographing Mars on approach"], ["Jul 15, 1965", "Closest approach, 9,846 km above the surface"], ["Dec 1967", "Mission ended after extra tests while orbiting the Sun"]],
+			"facts": ["It took 21 full photos plus part of a 22nd, covering about 1% of Mars.", "Data reached Earth at 8⅓ bits per second, so each photo took about 8 hours to send.", "Engineers were so eager that they hand-coloured the first image with pastel crayons from printed numbers before the computer finished it.", "Its cratered, Moon-like photos ended old ideas of canals and a lush Mars."]}},
+		{"id": "viking1", "name": "Viking 1", "years": "1975–1982", "diff": "Easy", "reward": 15, "kind": "Collect",
+		"brief": "The first US spacecraft to land safely on Mars and search for life. Scoop soil samples and run the biology experiments.",
+		"steps": [
+			{"type": "collect", "text": "Scoop soil samples", "cluster": [200, 46, 7], "items": [["Soil sample", "can", "c8763e"], ["Soil sample", "can", "c8763e"], ["Soil sample", "can", "c8763e"]]},
+			{"type": "deliver", "text": "Run the biology experiments at Mission Control", "to": "mc"}],
+		"history": {"sub": "First successful US landing on Mars",
+			"dates": [["Aug 20, 1975", "Launched from Cape Canaveral"], ["Jun 19, 1976", "Entered orbit around Mars"], ["Jul 20, 1976", "Landed in Chryse Planitia, 7 years to the day after Apollo 11 landed on the Moon"], ["Nov 1982", "Contact with the lander was lost"]],
+			"facts": ["It sent the first photo ever taken on the Martian surface, minutes after landing.", "A robotic arm scooped soil into three biology experiments looking for microbes.", "Most scientists concluded the results came from unusual soil chemistry, not life.", "The lander worked for more than 6 years, far beyond its 90-day goal."]}},
+		{"id": "pathfinder", "name": "Mars Pathfinder & Sojourner", "years": "1996–1997", "diff": "Medium", "reward": 25, "kind": "Collect & assemble",
+		"brief": "Pathfinder bounced to a landing on airbags and released Sojourner, the first rover on Mars. Gather its parts, build it, then scan a rock.",
+		"steps": [
+			{"type": "collect", "text": "Find the Sojourner parts", "cluster": [250, 48, 9], "items": [["Chassis", "box", "d8d2c8"], ["Rocker-bogie wheels", "wheel", "50545c"], ["Solar panel", "panel", "2a3f7a"], ["APXS spectrometer", "can", "d4a43a"]]},
+			{"type": "deliver", "text": "Bring the parts to the garage workbench", "to": "bench"},
+			{"type": "assemble", "title": "Assemble Sojourner", "text": "Tap the parts in the order the rover goes together.", "parts": [
+				{"name": "Chassis", "clue": "Start with the insulated box that holds the computer. Everything else mounts on it.", "fact": "The “warm electronics box” kept the computer from freezing at night."},
+				{"name": "Rocker-bogie wheels", "clue": "Next comes what lets the rover roll and climb over rocks.", "fact": "Six wheels on rocker-bogie suspension, a design later used on every NASA Mars rover."},
+				{"name": "Solar panel", "clue": "Now the flat power source that sits on top.", "fact": "A small solar panel on top powered the rover."},
+				{"name": "APXS spectrometer", "clue": "Last, the science instrument on the back.", "fact": "The APXS measured which chemical elements a rock contained."}]},
+			{"type": "visit", "text": "Scan the rock Barnacle Bill", "verb": "Scan Barnacle Bill", "points": [[290, 36]], "rock": true, "r": 3.0}],
+		"history": {"sub": "The first rover on another planet",
+			"dates": [["Dec 4, 1996", "Launched from Cape Canaveral"], ["Jul 4, 1997", "Landed in Ares Vallis, bouncing about 15 times on airbags"], ["Jul 1997", "Sojourner rolled down a ramp onto the surface"], ["Sep 27, 1997", "Last transmission from the mission"]],
+			"facts": ["Sojourner was about the size of a microwave oven and weighed roughly 11 kg.", "It was planned to work for 7 sols and lasted 83.", "Its name honours Sojourner Truth and was chosen in a student essay contest.", "Barnacle Bill was the first rock it analysed."]}},
+		{"id": "opportunity", "name": "Opportunity rover", "years": "2003–2019", "diff": "Medium", "reward": 20, "kind": "Collect & drive",
+		"brief": "Opportunity found tiny hematite “blueberries” that formed in water, then drove a marathon across Mars. Collect blueberries, then drive to a crater rim.",
+		"steps": [
+			{"type": "collect", "text": "Collect hematite blueberries", "cluster": [25, 64, 6], "items": [["Blueberry", "berry", "7d8aa6"], ["Blueberry", "berry", "7d8aa6"], ["Blueberry", "berry", "7d8aa6"], ["Blueberry", "berry", "7d8aa6"], ["Blueberry", "berry", "7d8aa6"]]},
+			{"type": "visit", "text": "Drive ARES to the crater rim", "verb": "Reach the rim", "points": [[335, 150]], "need_rover": true, "r": 6.0}],
+		"history": {"sub": "A 90-sol mission that lasted almost 15 years",
+			"dates": [["Jul 7, 2003", "Launched from Cape Canaveral"], ["Jan 25, 2004", "Landed in Meridiani Planum and rolled into a small crater, a “hole in one”"], ["Mar 2015", "Passed marathon distance, 42.2 km"], ["Jun 10, 2018", "Last contact, during a planet-wide dust storm"], ["Feb 13, 2019", "NASA declared the mission complete"]],
+			"facts": ["It was designed to last 90 sols and worked for more than 5,000.", "The hematite “blueberries” showed liquid water once soaked the rocks.", "It drove 45.16 km in total, a record for driving on another world.", "Its twin, Spirit, landed three weeks earlier on the other side of Mars."]}},
+		{"id": "insight", "name": "InSight lander", "years": "2018–2022", "diff": "Medium", "reward": 25, "kind": "Collect & assemble",
+		"brief": "InSight listened for marsquakes to map the inside of Mars. Gather the instruments and set them up on flat ground.",
+		"steps": [
+			{"type": "collect", "text": "Collect the instruments", "cluster": [135, 62, 7], "items": [["SEIS seismometer", "can", "d4a43a"], ["Wind & thermal shield", "dome", "e8e4de"], ["Heat probe (the mole)", "blade", "8a9099"]]},
+			{"type": "deliver", "text": "Carry them to the deployment site", "to": [118, 80], "label": "Deployment site"},
+			{"type": "assemble", "title": "Deploy InSight’s instruments", "text": "Tap the instruments in the order the robotic arm placed them.", "parts": [
+				{"name": "SEIS seismometer", "clue": "First, the instrument that feels the ground shake goes down.", "fact": "Dec 19, 2018: the arm set the seismometer on the surface."},
+				{"name": "Wind & thermal shield", "clue": "Next, cover the seismometer to protect it from wind and cold.", "fact": "Feb 2, 2019: the dome-shaped shield was lowered over it."},
+				{"name": "Heat probe (the mole)", "clue": "Last, the instrument meant to hammer itself into the ground.", "fact": "Feb 12, 2019: the heat probe was placed beside them."}]}],
+		"history": {"sub": "The first spacecraft to study the deep interior of Mars",
+			"dates": [["May 5, 2018", "Launched from Vandenberg, California, the first interplanetary launch from the US West Coast"], ["Nov 26, 2018", "Landed on the flat plain of Elysium Planitia"], ["Apr 6, 2019", "Detected its first marsquake"], ["May 4, 2022", "Recorded the largest marsquake ever measured, magnitude 4.7"], ["Dec 2022", "Mission ended as dust covered its solar panels"]],
+			"facts": ["It detected 1,319 marsquakes.", "Quake waves revealed the thickness of the crust and mantle and the size of the liquid core, the numbers in this simulator’s Inside Mars view.", "The “mole” never dug deep enough because the soil was unexpectedly clumpy.", "The seismometer could sense movements smaller than the width of a hydrogen atom."]}},
+		{"id": "curiosity", "name": "Curiosity rover", "years": "2011–today", "diff": "Hard", "reward": 35, "kind": "Collect, assemble & drive",
+		"brief": "Curiosity landed right here in Gale Crater and drilled rock to find an ancient lake. Build its drill, fit it to ARES, and drill the first rock.",
+		"steps": [
+			{"type": "collect", "text": "Find the drill parts", "cluster": [225, 72, 9], "items": [["MMRTG power unit", "can", "8a9099"], ["Robotic arm", "blade", "d8d2c8"], ["Drill bit", "box", "b8bcc4"]]},
+			{"type": "deliver", "text": "Bring the parts to the garage workbench", "to": "bench"},
+			{"type": "assemble", "title": "Build the drill", "text": "Tap the parts in the order needed to get the drill working.", "parts": [
+				{"name": "MMRTG power unit", "clue": "Start with the power source. Nothing works without it.", "fact": "Curiosity runs on heat from decaying plutonium-238, not solar panels."},
+				{"name": "Robotic arm", "clue": "Next, the 2.1 m limb that carries tools to a rock.", "fact": "The arm is 2.1 m long and holds five tools at its end."},
+				{"name": "Drill bit", "clue": "Last, the tool on the very end of the arm.", "fact": "The drill hammers and spins to turn rock into powder for analysis."}]},
+			{"type": "act", "text": "Drive ARES to John Klein and drill", "label": "Drill John Klein", "to": [305, 105], "loc_label": "John Klein", "need_rover": true, "anim": "drill"}],
+		"history": {"sub": "The car-sized rover exploring Gale Crater",
+			"dates": [["Nov 26, 2011", "Launched from Cape Canaveral"], ["Aug 6, 2012", "Landed in Gale Crater, lowered on cables by a rocket-powered sky crane"], ["Feb 8, 2013", "Drilled its first rock, named John Klein"], ["Mar 12, 2013", "NASA announced Gale once had a lake that could have supported microbes"], ["Today", "Still climbing Mount Sharp"]],
+			"facts": ["It is the size of a small car and weighs about 900 kg.", "Engineers called the landing “seven minutes of terror” because it had to happen entirely on its own.", "Powder from John Klein contained clay minerals formed in water that was neither too acidic nor too salty.", "Mount Sharp, on your horizon, is the layered mountain Curiosity has been climbing for years."]}},
+		{"id": "ingenuity", "name": "Perseverance & Ingenuity", "years": "2020–2024", "diff": "Hard", "reward": 40, "kind": "Collect, assemble & fly",
+		"brief": "Perseverance carried Ingenuity, the first aircraft to fly on another planet. Gather its parts, assemble it on the landing pad and make the first flight.",
+		"steps": [
+			{"type": "collect", "text": "Find the helicopter parts", "cluster": [60, 84, 9], "items": [["Landing legs", "wheel", "b8bcc4"], ["Fuselage", "box", "d4a43a"], ["Rotor blades", "blade", "30333a"], ["Solar panel", "panel", "2a3f7a"]]},
+			{"type": "deliver", "text": "Bring the parts to the landing pad", "to": "pad"},
+			{"type": "assemble", "title": "Assemble Ingenuity", "text": "Build the helicopter from the ground up.", "parts": [
+				{"name": "Landing legs", "clue": "Start at the bottom, with what it stands on.", "fact": "Four springy carbon-fibre legs absorb the landing."},
+				{"name": "Fuselage", "clue": "Next, the tissue-box-sized body holding the batteries and computer.", "fact": "Heaters in the fuselage kept it alive through nights near −90 °C."},
+				{"name": "Rotor blades", "clue": "Then the two blades that spin in opposite directions.", "fact": "Two 1.2 m rotors spin at about 2,400 rpm because the air is so thin."},
+				{"name": "Solar panel", "clue": "Finally, the part that sits right on top of the mast.", "fact": "A small solar panel above the rotors recharged the batteries."}]},
+			{"type": "act", "text": "Fly Ingenuity from the landing pad", "label": "Fly Ingenuity", "to": "pad", "anim": "heli"}],
+		"history": {"sub": "The first powered flight on another planet",
+			"dates": [["Jul 30, 2020", "Perseverance launched from Cape Canaveral with Ingenuity tucked underneath"], ["Feb 18, 2021", "Landed in Jezero Crater, an ancient lake bed"], ["Apr 19, 2021", "Ingenuity’s first flight: 39 seconds, 3 m high"], ["Apr 20, 2021", "MOXIE made oxygen from Martian air for the first time"], ["Jan 18, 2024", "72nd and final flight; a damaged rotor ended the mission"]],
+			"facts": ["Ingenuity weighed 1.8 kg. It was planned to fly 5 times and flew 72.", "It carried a tiny piece of fabric from the Wright brothers’ 1903 Flyer.", "In total it flew about 17 km.", "MOXIE made 122 g of oxygen, about what a small dog breathes in 10 hours."]}}
 	]
-	modal_body.add_child(_wrap(_lbl(str(msgs[bracket]), 17), 600))
-	modal_body.add_child(_button("Continue mission", Color(0.25, 0.5, 0.2), _close_modal, 17, Vector2(0, 48)))
-	modal_body.add_child(_button("Save & return to orbit", Color(0.4, 0.3, 0.2), _return_to_menu, 15, Vector2(0, 42)))
+
+	const LOCATIONS := {
+		"mc": {"p": [4.5, 3.8], "r": 2.9, "label": "Mission Control"},
+		"bench": {"p": [49.6, -4.5], "r": 3.6, "label": "Garage workbench"},
+		"pad": {"p": [0.0, 46.0], "r": 6.5, "label": "Landing pad"}
+	}
+
+	const CHALLENGES := {
+		"jump": {"text": "Exercise: do 10 low-gravity jumps", "why": "Astronauts exercise about 2 hours a day so bones and muscles stay strong in low gravity.", "target": 10, "reward": 8},
+		"walk": {"text": "Walk 250 m on foot", "target": 250, "unit": " m", "reward": 8},
+		"drive": {"text": "Drive ARES 600 m", "target": 600, "unit": " m", "reward": 8},
+		"greenhouse": {"text": "Check on 3 greenhouses", "why": "Walk up to a greenhouse to inspect its plants.", "target": 3, "reward": 8},
+		"gems": {"text": "Find 3 gems on the terrain", "target": 3, "reward": 8},
+		"o2check": {"text": "Inspect the oxygen tanks", "target": 1, "reward": 5},
+		"comms": {"text": "Call home from the Mission Control desk", "why": "A message takes between 3 and 22 minutes to reach Earth, depending on where the planets are.", "target": 1, "reward": 5}
+	}
+
+	const DAILY_REWARD := {"meals": 6, "rest": 4, "sleep": 6, "bonus": 10}
+
+	const MEALS := ["freeze-dried tacos", "Martian potato stew from Greenhouse 1", "space lasagne", "tomato soup with greenhouse basil", "a peanut butter tortilla"]
+
+	const SCENARIOS := [
+		{"id": "storm", "title": "Dust storm incoming", "blurb": "A regional storm is heading for Gale Crater.", "nodes": {
+			"start": {"text": "Orbital weather data shows a regional dust storm heading for Gale Crater. It will darken the sky and cut solar power for days. In 2018 a storm like this ended NASA’s Opportunity rover.", "options": [
+				{"label": "Seal the base and power down", "gain": "Crew and batteries stay safe", "loss": "Greenhouse grow lights go dark", "next": "a"},
+				{"label": "Drive out and recover the weather station", "gain": "Save weeks of storm data", "loss": "A risky drive with low visibility", "next": "b"}]},
+			"a": {"text": "Day two of the storm. Solar power has dropped to 10%, and the batteries are getting low.", "options": [
+				{"label": "Power only life support", "gain": "Oxygen keeps flowing", "loss": "No contact with Earth for a sol", "next": "e1"},
+				{"label": "Start the backup fuel cell", "gain": "Everything stays on and the plants survive", "loss": "Uses your emergency fuel reserve (costs gems)", "next": "e2"}]},
+			"b": {"text": "You reach the station as the sky turns brown. Visibility is down to 20 m.", "options": [
+				{"label": "Follow the rover’s recorded track home", "gain": "A safe, known route", "loss": "It’s slow, and the drive eats oxygen", "next": "e3"},
+				{"label": "Take the shortcut through the gully", "gain": "Home in half the time", "loss": "Unknown terrain, you could get stuck", "next": "e4"}]},
+			"e1": {"end": true, "title": "Quiet sols", "text": "The base rides out the storm on minimal power. Earth worries for a sol, but everyone is fine. A few lettuce plants wilt.", "fx": {"gems": 10, "energy": -10}},
+			"e2": {"end": true, "title": "Lights on", "text": "The fuel cell keeps the greenhouses alive and the crew comfortable, but the emergency reserve is gone.", "fx": {"gems": -5, "energy": 30, "o2": 20}},
+			"e3": {"end": true, "title": "Data delivered", "text": "You crawl home along your own tracks with the station strapped on. Scientists get the best storm record ever taken in Gale.", "fx": {"gems": 25, "o2": -30}},
+			"e4": {"end": true, "title": "Stuck in the gully", "text": "A wheel sinks into soft sand. You dig ARES out by hand and limp home exhausted, but the station is safe.", "fx": {"gems": 15, "energy": -40, "o2": -20}}}},
+		{"id": "water", "title": "Water recycler failure", "blurb": "The machine that recycles your drinking water has stopped.", "nodes": {
+			"start": {"text": "The recycler that turns used water back into drinking water has stopped. You have 3 sols of stored water.", "options": [
+				{"label": "Repair it yourself now", "gain": "Water flowing again today", "loss": "Uses spare parts and lots of energy", "next": "a"},
+				{"label": "Ask Earth for help", "gain": "Engineers send an exact fix", "loss": "Each message takes up to 22 minutes to reach Earth", "next": "b"}]},
+			"a": {"text": "Inside the recycler you find a cracked filter and a clogged pump.", "options": [
+				{"label": "Swap in your only spare pump", "gain": "A quick, reliable fix", "loss": "No spare left for next time", "next": "e1"},
+				{"label": "Clean the old pump and patch the filter", "gain": "Saves the spare", "loss": "Takes hours and tires you out", "next": "e2"}]},
+			"b": {"text": "Earth replies the next morning: try a software reset first, then swap the pump if needed.", "options": [
+				{"label": "Try the software reset", "gain": "Free and fast if it works", "loss": "Might not fix a hardware fault", "next": "e3"},
+				{"label": "Go straight to the pump swap", "gain": "Certain to work", "loss": "Uses your only spare pump", "next": "e4"}]},
+			"e1": {"end": true, "title": "Fixed fast", "text": "Water flows within the hour. Mission Control adds a spare pump to the next cargo flight.", "fx": {"gems": 15, "energy": -15}},
+			"e2": {"end": true, "title": "Resourceful", "text": "After a long shift the patched pump hums back to life. Saving the spare is a real Mars skill.", "fx": {"gems": 25, "energy": -40}},
+			"e3": {"end": true, "title": "Lucky reset", "text": "The reset clears a faulty sensor and the recycler restarts. The wait cost you a thirsty sol.", "fx": {"gems": 20, "energy": -20}},
+			"e4": {"end": true, "title": "By the book", "text": "The new pump works perfectly, following Earth’s checklist step by step.", "fx": {"gems": 12, "energy": -5}}}},
+		{"id": "rock", "title": "A strange rock", "blurb": "You spot an unusual rock that may have formed in water.", "nodes": {
+			"start": {"text": "On a drive near Mount Sharp you spot a pale rock streaked with white veins. It might have formed in water.", "options": [
+				{"label": "Drill a sample right now", "gain": "Science results today", "loss": "Wears the drill bit and drains the battery", "next": "a"},
+				{"label": "Photograph it and return with the full science kit", "gain": "Better instruments, better data", "loss": "Costs time, and the route back is long", "next": "b"}]},
+			"a": {"text": "The drill reaches 2 cm and the powder looks unusual. The rover battery is at 30%.", "options": [
+				{"label": "Analyse the powder in the rover’s lab", "gain": "Instant answers", "loss": "The battery will be nearly empty for the drive home", "next": "e1"},
+				{"label": "Seal the sample and analyse it at base", "gain": "A safe trip home", "loss": "Results wait until tomorrow", "next": "e2"}]},
+			"b": {"text": "Next sol you return with the full kit. A ridge of similar rocks runs uphill.", "options": [
+				{"label": "Carefully sample just the first rock", "gain": "One high-quality result", "loss": "You might miss the bigger picture", "next": "e3"},
+				{"label": "Survey the whole ridge", "gain": "Map a possible ancient stream", "loss": "A long, exhausting day", "next": "e4"}]},
+			"e1": {"end": true, "title": "Gypsum!", "text": "The lab finds calcium sulfate, the same mineral Curiosity found in white veins in Gale Crater, left behind by groundwater. You coast home on fumes.", "fx": {"gems": 20, "o2": -25}},
+			"e2": {"end": true, "title": "Patient science", "text": "Back at base the sample confirms water-formed minerals. Safe and solid work.", "fx": {"gems": 15}},
+			"e3": {"end": true, "title": "One perfect sample", "text": "Your sample is pristine and goes into a sealed tube for a future return to Earth, like Perseverance’s samples.", "fx": {"gems": 20}},
+			"e4": {"end": true, "title": "The ancient stream", "text": "The ridge traces an old streambed. Scientists are thrilled, and you are exhausted.", "fx": {"gems": 35, "energy": -45}}}}
+	]
+
+	const FACTS_TEXT := """[b]Gravity[/b]  3.72 m/s², 38% of Earth’s
+	[b]One full spin[/b]  24 h 37 min (a sol is 24 h 40 min)
+	[b]One Mars year[/b]  687 Earth days
+	[b]Radius[/b]  3,390 km, about half of Earth’s
+	[b]Average temperature[/b]  −63 °C
+	[b]Axial tilt[/b]  25.2°, so Mars has seasons
+
+	[b]Moons[/b]
+	[b]Phobos[/b], about 22 km across, circles Mars every 7 h 39 min only ~6,000 km above the surface. It is slowly spiralling inward.
+	[b]Deimos[/b], about 12 km across, takes 30 h 18 min per orbit at ~20,000 km up.
+	[i]Moon sizes and distances are enlarged so both fit on screen.[/i]"""
+
+	const LAYERS_TEXT := """You’re looking at a slice cut out of Mars. Zoom out to see the surface again.
+
+	[b][color=#d08a5e]Crust[/color][/b]
+	Thickness: 24–72 km (avg. ~40 km)
+	Temperature: −63 °C at the surface, a few hundred °C at its base
+	Made of: basalt rock; iron-oxide dust makes it red
+	State: solid
+
+	[b][color=#ff8a3a]Mantle[/color][/b]
+	Thickness: ~1,550 km
+	Temperature: ~500 °C near the top to ~1,500 °C near the core
+	Made of: silicate rock rich in iron and magnesium
+	State: solid, with a likely molten layer at the very bottom
+
+	[b][color=#ffc04a]Core[/color][/b]
+	Radius: ~1,650–1,830 km
+	Temperature: ~1,600–2,000 °C (estimated)
+	Made of: iron and nickel with lots of sulfur and lighter elements
+	State: liquid, but no longer powers a global magnetic field
+
+	[i]Figures come from NASA’s InSight lander (2018–2022). The crust is drawn thicker than real life so you can see it.[/i]"""
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  RADAR (inner class)
-# ═══════════════════════════════════════════════════════════════════════════
-class RadarView extends Control:
-	var game
-	const RANGE := 90.0
+# ======================================================================
+# The astronaut model and animation
+# ======================================================================
+class Avatar extends Node3D:
+	const SUITS := [
+		{"name": "NASA white", "main": "f1ede6", "accent": "2f6fb5", "trim": "c23b2a"},
+		{"name": "Mars orange", "main": "e8742f", "accent": "f2e6d8", "trim": "3a2a24"},
+		{"name": "Explorer blue", "main": "3c74c4", "accent": "f2c14e", "trim": "e8e8ea"},
+		{"name": "Stealth", "main": "30333a", "accent": "5fd3c4", "trim": "8a9099"},
+		{"name": "Desert camo", "main": "b59a6a", "accent": "5b6b3a", "trim": "6e4b2a"},
+		{"name": "Nebula purple", "main": "7a54b8", "accent": "ffb0e0", "trim": "e8e2f2"}]
+	const SKINS := ["f3d2b6", "d9a77f", "a96e48", "6e4429"]
+	const HELMETS := [["classic", "Classic"], ["bubble", "Bubble"], ["visor", "Visor pro"], ["retro", "Retro"]]
 
-	func _map(rel: Vector2, right: Vector2, fwd: Vector2, c: Vector2, k: float, clamp_r := -1.0) -> Vector2:
-		var v := Vector2(rel.dot(right), -rel.dot(fwd)) * k
-		if clamp_r > 0.0 and v.length() > clamp_r:
-			v = v.normalized() * clamp_r
-		return c + v
+	var leg_l: Node3D
+	var leg_r: Node3D
+	var arm_l: Node3D
+	var arm_r: Node3D
+	var swing := 0.0
 
-	func _kind_col(kind: String) -> Color:
-		match kind:
-			"iron":
-				return Color(1.0, 0.45, 0.25)
-			"silica":
-				return Color(0.95, 0.9, 1.0)
-			"ice":
-				return Color(0.5, 0.85, 1.0)
-		return Color(0.75, 0.55, 1.0)
+	func build(cfg: Dictionary) -> void:
+		for c in get_children():
+			c.queue_free()
+		var suit: Dictionary = SUITS[clampi(int(cfg.get("suit", 0)), 0, SUITS.size() - 1)]
+		var fem: bool = cfg.get("gender", "female") == "female"
+		var m_suit := Mk.mat(Color(suit["main"]), 0.75)
+		var m_acc := Mk.mat(Color(suit["accent"]), 0.5, 0.15)
+		var m_trim := Mk.mat(Color(suit["trim"]), 0.6)
+		var m_skin := Mk.mat(Color(SKINS[clampi(int(cfg.get("skin", 1)), 0, 3)]), 0.8)
+		var m_dark := Mk.mat(Color("24262c"), 0.6, 0.3)
+		var m_hair := Mk.mat(Color("3b2416") if fem else Color("2a1a10"), 0.9)
+		var sh := 0.27 if fem else 0.33
+		var hip := 0.15 if fem else 0.13
+		leg_l = _leg(1, hip, fem, m_suit, m_trim, m_dark)
+		leg_r = _leg(-1, hip, fem, m_suit, m_trim, m_dark)
+		Mk.cyl(self, 0.25 if fem else 0.3, 0.26 if fem else 0.24, 0.62, m_suit, Vector3(0, 1.22, 0))
+		Mk.torus(self, 0.25, 0.04, m_acc, Vector3(0, 0.94, 0))
+		var front := 0.24 if fem else 0.27
+		Mk.box(self, Vector3(0.3, 0.2, 0.08), m_trim, Vector3(0, 1.28, front))
+		var bc := [Color("ff5a4a"), Color("f2c14e"), Color("5fd3c4")]
+		for i in 3:
+			Mk.sphere(self, 0.025, Mk.unshaded(bc[i]), Vector3(-0.08 + i * 0.08, 1.3, front + 0.045), 8)
+		Mk.box(self, Vector3(0.46, 0.62, 0.24), Mk.mat(Color("e8e4de"), 0.6), Vector3(0, 1.25, -0.36))
+		Mk.cyl(self, 0.07, 0.07, 0.55, m_acc, Vector3(0.12, 1.27, -0.5), 10)
+		Mk.cyl(self, 0.07, 0.07, 0.55, m_acc, Vector3(-0.12, 1.27, -0.5), 10)
+		arm_l = _arm(1, sh, m_suit, m_acc, m_trim)
+		arm_r = _arm(-1, sh, m_suit, m_acc, m_trim)
+		Mk.torus(self, 0.17, 0.035, m_trim, Vector3(0, 1.56, 0))
+		var head := Node3D.new()
+		head.position.y = 1.76
+		add_child(head)
+		Mk.sphere(head, 0.15, m_skin, Vector3.ZERO, 20)
+		var eye := Mk.unshaded(Color("1a1210"))
+		Mk.sphere(head, 0.02, eye, Vector3(0.05, 0.02, 0.135), 8)
+		Mk.sphere(head, 0.02, eye, Vector3(-0.05, 0.02, 0.135), 8)
+		Mk.box(head, Vector3(0.05, 0.012, 0.01), Mk.mat(Color("9a4a3a")), Vector3(0, -0.055, 0.142))
+		var cap := Mk.sphere(head, 0.158, m_hair, Vector3(0, 0.03, -0.02), 18, true)
+		cap.rotation.x = -0.3
+		if fem:
+			var back := Mk.sphere(head, 0.162, m_hair, Vector3(0, -0.04, -0.03), 18)
+			back.scale = Vector3(1.04, 1.1, 0.9)
+			Mk.sphere(head, 0.06, m_hair, Vector3(0, 0.0, -0.17), 10)
+		var glass := Mk.glass()
+		var hw := Mk.mat(Color("f2efe9"), 0.4, 0.1)
+		match str(cfg.get("helmet", "classic")):
+			"bubble":
+				Mk.sphere(head, 0.27, glass, Vector3.ZERO, 24)
+				Mk.cyl(head, 0.006, 0.006, 0.25, Mk.mat(Color("9aa0a8")), Vector3(0.12, 0.33, -0.05), 6)
+				Mk.sphere(head, 0.02, Mk.unshaded(Color("ff5a4a")), Vector3(0.12, 0.46, -0.05), 8)
+			"visor":
+				Mk.box(head, Vector3(0.46, 0.44, 0.46), hw, Vector3(0, 0.02, 0))
+				Mk.box(head, Vector3(0.4, 0.18, 0.02), Mk.emissive(Color("0b2a3a"), 0.6), Vector3(0, 0.04, 0.235))
+				Mk.box(head, Vector3(0.06, 0.12, 0.36), m_acc, Vector3(0, 0.28, -0.02))
+			"retro":
+				Mk.cyl(head, 0.24, 0.24, 0.42, glass, Vector3.ZERO, 24)
+				Mk.sphere(head, 0.245, Mk.mat(Color("b8bcc4"), 0.35, 0.6), Vector3(0, 0.2, 0), 20, true)
+				Mk.torus(head, 0.245, 0.025, Mk.mat(Color("b8bcc4"), 0.35, 0.6), Vector3(0, -0.2, 0))
+				Mk.torus(head, 0.245, 0.02, m_acc, Vector3(0, 0.19, 0))
+			_:
+				Mk.sphere(head, 0.27, hw, Vector3.ZERO, 24)
+				var vis := Mk.sphere(head, 0.2, Mk.emissive(Color("d4a43a"), 0.35), Vector3(0, 0.0, 0.12), 20)
+				vis.scale = Vector3(1.0, 0.75, 0.8)
+				Mk.box(head, Vector3(0.06, 0.06, 0.06), Mk.unshaded(Color("fff6d8")), Vector3(0.22, 0.1, 0.13))
+				Mk.box(head, Vector3(0.06, 0.06, 0.06), Mk.unshaded(Color("fff6d8")), Vector3(-0.22, 0.1, 0.13))
+		var nm := str(cfg.get("name", "")).strip_edges()
+		if nm == "":
+			nm = "Astronaut"
+		Mk.label(self, nm, Vector3(0, 2.45, 0), 40, Color(suit["accent"]).lightened(0.3), 0.008)
+
+	func _leg(side: int, hip: float, fem: bool, m_suit, m_trim, m_dark) -> Node3D:
+		var p := Node3D.new()
+		p.position = Vector3(side * hip, 0.92, 0)
+		add_child(p)
+		Mk.cyl(p, 0.1 if fem else 0.11, 0.09, 0.82, m_suit, Vector3(0, -0.41, 0), 12)
+		var kn := Mk.sphere(p, 0.1, m_trim, Vector3(0, -0.45, 0.02), 10)
+		kn.scale = Vector3(1, 0.6, 1)
+		Mk.box(p, Vector3(0.2, 0.16, 0.32), m_dark, Vector3(0, -0.84, 0.05))
+		return p
+
+	func _arm(side: int, sh: float, m_suit, m_acc, m_trim) -> Node3D:
+		var p := Node3D.new()
+		p.position = Vector3(side * (sh + 0.04), 1.47, 0)
+		add_child(p)
+		Mk.cyl(p, 0.08, 0.07, 0.6, m_suit, Vector3(0, -0.3, 0), 12)
+		Mk.sphere(p, 0.085, m_acc, Vector3(0, -0.63, 0), 10)
+		var pad := Mk.sphere(p, 0.11, m_trim, Vector3.ZERO, 12)
+		pad.scale = Vector3(1, 0.8, 1)
+		return p
+
+	## Walking / jumping / seated poses.
+	func pose(dt: float, moving: bool, on_ground: bool, walk_t: float, seated: bool) -> void:
+		if leg_l == null:
+			return
+		if seated:
+			leg_l.rotation.x = -1.45
+			leg_r.rotation.x = -1.45
+			arm_l.rotation.x = -0.9
+			arm_r.rotation.x = -0.9
+			return
+		var k := 1.0 - exp(-dt * 12.0)
+		swing = lerp(swing, 1.0 if (moving and on_ground) else 0.0, 1.0 - exp(-dt * 10.0))
+		var s := sin(walk_t) * 0.75 * swing
+		var l_l := s
+		var l_r := -s
+		var a_l := -s * 0.8
+		var a_r := s * 0.8
+		if not on_ground:
+			l_l = -0.6
+			l_r = 0.25
+			a_l = -2.5
+			a_r = -2.5
+		leg_l.rotation.x = lerp(leg_l.rotation.x, l_l, k)
+		leg_r.rotation.x = lerp(leg_r.rotation.x, l_r, k)
+		arm_l.rotation.x = lerp(arm_l.rotation.x, a_l, k)
+		arm_r.rotation.x = lerp(arm_r.rotation.x, a_r, k)
+		arm_l.rotation.z = 0.12
+		arm_r.rotation.z = -0.12
+
+
+# ======================================================================
+# ARES, the six-wheeled rover
+# ======================================================================
+class Rover extends Node3D:
+	var heading := -PI / 2.0
+	var speed := 0.0
+	var pitch := 0.0
+	var roll := 0.0
+	var wheels: Array = []
+	var steers: Array = []
+	var body: Node3D
+	var drill_fore: Node3D
+	var drill_bit: Node3D
+
+	func _ready() -> void:
+		body = Node3D.new()
+		add_child(body)
+		var white := Mk.mat(Color("ece7e0"), 0.55, 0.1)
+		var orange := Mk.mat(Color("e0632c"), 0.5, 0.1)
+		var dark := Mk.mat(Color("2c3038"), 0.6, 0.3)
+		var grey := Mk.mat(Color("9aa0a8"), 0.5, 0.35)
+		var solar := Mk.mat(Color("1b2b5a"), 0.25, 0.6)
+		Mk.box(body, Vector3(2.1, 0.5, 3.8), white, Vector3(0, 0.98, 0))
+		Mk.box(body, Vector3(2.16, 0.12, 3.86), orange, Vector3(0, 0.72, 0))
+		for side in [1, -1]:
+			var ares := Mk.label(body, "ARES", Vector3(side * 1.07, 0.98, 0.3), 110, Color.WHITE, 0.004, false)
+			ares.outline_size = 18
+			ares.rotation.y = PI / 2.0 * side
+			var sub := Mk.label(body, "MARS ROVER 01", Vector3(side * 1.07, 0.84, -1.05), 34, Color("3a2a24"), 0.004, false)
+			sub.outline_size = 0
+			sub.rotation.y = PI / 2.0 * side
+		Mk.box(body, Vector3(0.8, 0.14, 0.7), dark, Vector3(0, 1.3, 0.15))
+		Mk.box(body, Vector3(0.8, 0.75, 0.14), dark, Vector3(0, 1.62, -0.25))
+		Mk.box(body, Vector3(1.8, 0.45, 0.35), grey, Vector3(0, 1.45, 1.55))
+		Mk.box(body, Vector3(1.0, 0.04, 0.25), Mk.unshaded(Color("5fd3c4")), Vector3(0, 1.69, 1.5))
+		Mk.box(body, Vector3(0.08, 1.1, 0.08), dark, Vector3(0.95, 1.75, -0.55))
+		Mk.box(body, Vector3(0.08, 1.1, 0.08), dark, Vector3(-0.95, 1.75, -0.55))
+		Mk.box(body, Vector3(2.0, 0.08, 0.08), dark, Vector3(0, 2.3, -0.55))
+		var sp := Mk.box(body, Vector3(2.0, 0.06, 1.2), solar, Vector3(0, 1.45, -1.25))
+		sp.rotation.x = -0.12
+		Mk.cyl(body, 0.05, 0.05, 1.5, grey, Vector3(0.75, 2.0, -1.6), 8)
+		Mk.box(body, Vector3(0.36, 0.22, 0.28), white, Vector3(0.75, 2.8, -1.55))
+		var lm := Mk.unshaded(Color("fff6d8"))
+		Mk.box(body, Vector3(0.3, 0.14, 0.05), lm, Vector3(0.65, 1.05, 1.92))
+		Mk.box(body, Vector3(0.3, 0.14, 0.05), lm, Vector3(-0.65, 1.05, 1.92))
+		var tire := Mk.mat(Color("26272b"), 0.95)
+		var hubm := Mk.mat(Color("b8bcc4"), 0.4, 0.5)
+		for w in [[1.22, 1.35, true], [-1.22, 1.35, true], [1.22, 0.0, false], [-1.22, 0.0, false], [1.22, -1.35, false], [-1.22, -1.35, false]]:
+			var st := Node3D.new()
+			st.position = Vector3(w[0], 0.48, w[1])
+			add_child(st)
+			var spin := Node3D.new()
+			st.add_child(spin)
+			var t := Mk.cyl(spin, 0.48, 0.48, 0.4, tire, Vector3.ZERO, 20)
+			t.rotation.z = PI / 2.0
+			var h := Mk.cyl(spin, 0.22, 0.22, 0.42, hubm, Vector3.ZERO, 12)
+			h.rotation.z = PI / 2.0
+			for i in 10:
+				var a := TAU * i / 10.0
+				var tr := Mk.box(spin, Vector3(0.42, 0.07, 0.12), tire, Vector3(0, cos(a) * 0.49, sin(a) * 0.49))
+				tr.rotation.x = a
+			Mk.box(self, Vector3(0.12, 0.12, 0.5), grey, Vector3(w[0] * 0.9, 0.75, w[1]))
+			wheels.append(spin)
+			if w[2]:
+				steers.append(st)
+
+	## Curiosity mission reward: a drill arm on the front.
+	func add_drill() -> void:
+		if drill_fore:
+			return
+		var grey := Mk.mat(Color("9aa0a8"), 0.5, 0.35)
+		var arm := Node3D.new()
+		arm.position = Vector3(0.55, 1.05, 1.9)
+		body.add_child(arm)
+		Mk.box(arm, Vector3(0.1, 0.1, 0.7), grey, Vector3(0, 0, 0.35))
+		drill_fore = Node3D.new()
+		drill_fore.position.z = 0.7
+		arm.add_child(drill_fore)
+		Mk.box(drill_fore, Vector3(0.09, 0.6, 0.09), grey, Vector3(0, -0.3, 0))
+		Mk.box(drill_fore, Vector3(0.2, 0.18, 0.2), Mk.mat(Color("2c3038")), Vector3(0, -0.58, 0))
+		drill_bit = Mk.cyl(drill_fore, 0.03, 0.01, 0.3, Mk.mat(Color("b8bcc4"), 0.3, 0.7), Vector3(0, -0.72, 0), 8)
+
+
+# ======================================================================
+# On-screen joystick for touch screens
+# ======================================================================
+class Joystick extends Control:
+	var value := Vector2.ZERO
+	var touch_index := -1
+	var _knob := Vector2.ZERO
+	const R := 55.0
+
+	func _ready() -> void:
+		custom_minimum_size = Vector2(140, 140)
+		mouse_filter = Control.MOUSE_FILTER_STOP
+
+	func _gui_input(ev: InputEvent) -> void:
+		if ev is InputEventScreenTouch:
+			if ev.pressed and touch_index == -1:
+				touch_index = ev.index
+				_move(ev.position)
+			elif not ev.pressed and ev.index == touch_index:
+				touch_index = -1
+				value = Vector2.ZERO
+				_knob = Vector2.ZERO
+				queue_redraw()
+			accept_event()
+		elif ev is InputEventScreenDrag and ev.index == touch_index:
+			_move(ev.position)
+			accept_event()
+
+	func _move(local: Vector2) -> void:
+		var d := local - size / 2.0
+		if d.length() > R:
+			d = d.normalized() * R
+		_knob = d
+		value = Vector2(d.x / R, -d.y / R)
+		queue_redraw()
 
 	func _draw() -> void:
-		if game == null:
+		var c := size / 2.0
+		draw_circle(c, R + 12.0, Color(0.08, 0.04, 0.03, 0.35))
+		draw_arc(c, R + 12.0, 0, TAU, 48, Color(1, 1, 1, 0.3), 2.0)
+		draw_circle(c + _knob, 27.0, Color(1, 0.94, 0.9, 0.85))
+
+
+# ======================================================================
+# Round minimap that turns with the camera
+# ======================================================================
+class Minimap extends Control:
+	var base
+
+	func _ready() -> void:
+		custom_minimum_size = Vector2(150, 150)
+		mouse_filter = Control.MOUSE_FILTER_IGNORE
+
+	func _draw() -> void:
+		if base == null:
 			return
-		var c := size * 0.5
-		var rad := minf(size.x, size.y) * 0.5 - 3.0
-		var edge := rad - 5.0
-		draw_circle(c, rad + 3.0, Color(0.95, 0.45, 0.2, 0.9))
-		draw_circle(c, rad, Color(0.06, 0.03, 0.03, 0.88))
-		draw_arc(c, rad * 0.5, 0.0, TAU, 40, Color(1, 1, 1, 0.12), 1.0)
-		draw_line(c - Vector2(rad, 0), c + Vector2(rad, 0), Color(1, 1, 1, 0.07), 1.0)
-		draw_line(c - Vector2(0, rad), c + Vector2(0, rad), Color(1, 1, 1, 0.07), 1.0)
-		var pp: Vector3 = game.player_pos
-		var yaw: float = game.cam_yaw
-		var right := Vector2(cos(yaw), -sin(yaw))
-		var fwd := Vector2(-sin(yaw), -cos(yaw))
-		var k := rad / RANGE
-		var br: Rect2 = game.base_rect
-		var pts := PackedVector2Array()
-		for corner in [br.position, Vector2(br.end.x, br.position.y), br.end, Vector2(br.position.x, br.end.y)]:
-			var cv: Vector2 = corner
-			pts.append(_map(Vector2(cv.x - pp.x, cv.y - pp.z), right, fwd, c, k, edge))
-		draw_colored_polygon(pts, Color(0.3, 0.7, 1.0, 0.3))
-		pts.append(pts[0])
-		draw_polyline(pts, Color(0.4, 0.8, 1.0, 0.9), 1.5)
-		draw_circle(_map(Vector2(0.0 - pp.x, 14.0 - pp.z), right, fwd, c, k, edge), 3.0, Color(1.0, 0.6, 0.3))
-		for it in game.interactables:
-			var act: String = it["act"]
-			var ip: Vector3 = it["pos"]
-			var rel := Vector2(ip.x - pp.x, ip.z - pp.z)
-			if act == "deposit" and rel.length() < RANGE:
-				draw_circle(_map(rel, right, fwd, c, k), 2.5, _kind_col(str(it["kind"])))
-			elif act == "crate":
-				var sp := _map(rel, right, fwd, c, k, edge)
-				draw_rect(Rect2(sp - Vector2(4, 4), Vector2(8, 8)), Color(1.0, 0.8, 0.2))
-		for g in game.collectibles:
-			var gn: Node3D = g["node"]
-			var sp := _map(Vector2(gn.position.x - pp.x, gn.position.z - pp.z), right, fwd, c, k, edge)
-			draw_colored_polygon(PackedVector2Array([sp + Vector2(0, -5), sp + Vector2(4, 0), sp + Vector2(0, 5), sp + Vector2(-4, 0)]), Color(0.3, 1.0, 0.5))
-		if not game.driving:
-			var rp: Vector3 = game.rover.position
-			var rs := _map(Vector2(rp.x - pp.x, rp.z - pp.z), right, fwd, c, k, edge)
-			draw_rect(Rect2(rs - Vector2(3, 4), Vector2(6, 8)), Color(1.0, 0.5, 0.15))
-		if game.has_objective:
-			var op: Vector3 = game.objective_pos
-			var os := _map(Vector2(op.x - pp.x, op.z - pp.z), right, fwd, c, k, edge)
-			var t: float = game.time_accum
-			draw_arc(os, 5.0 + 3.0 * fmod(t * 1.5, 1.0), 0.0, TAU, 20, Color(1.0, 0.82, 0.3, 1.0 - fmod(t * 1.5, 1.0)), 2.0)
-		var h: float = game.rover_heading if game.driving else game.player_heading
-		var fdir := Vector2(-sin(h), -cos(h))
-		var sd := Vector2(fdir.dot(right), -fdir.dot(fwd)).normalized()
-		var perp := Vector2(-sd.y, sd.x)
-		draw_colored_polygon(PackedVector2Array([c + sd * 8.0, c - sd * 5.0 + perp * 5.0, c - sd * 5.0 - perp * 5.0]), Color.WHITE)
-		var npos := _map(Vector2(0, -1), right, fwd, Vector2.ZERO, 1.0).normalized() * (rad - 10.0) + c
-		draw_string(ThemeDB.fallback_font, npos + Vector2(-4, 5), "N", HORIZONTAL_ALIGNMENT_LEFT, -1, 13, Color(1.0, 0.6, 0.35))
+		var R := size.x / 2.0
+		var c := Vector2(R, R)
+		var sc := R / 110.0
+		draw_circle(c, R, Color(0.48, 0.21, 0.12, 0.85))
+		var cp: Vector3 = base.r_pos if base.in_rover else base.p_pos
+		var fwd := Vector2(-sin(base.cam_yaw), -cos(base.cam_yaw))
+		var ang := -PI / 2.0 - atan2(fwd.y, fwd.x)
+		var to_screen := func(wx: float, wz: float) -> Vector2:
+			return Vector2(wx - cp.x, wz - cp.z).rotated(ang) * sc
+		_dot(c, to_screen.call(0.0, 0.0), 9.0 * sc, Color(0.94, 0.91, 0.87, 0.85), R, false)
+		for g in base.gh_centers:
+			_dot(c, to_screen.call(g.x, g.y), 5.0 * sc, Color(0.49, 0.86, 0.52, 0.85), R, false)
+		_dot(c, to_screen.call(44.0, 0.0), 7.0 * sc, Color(0.94, 0.91, 0.87, 0.7), R, false)
+		_dot(c, to_screen.call(0.0, 46.0), 7.0 * sc, Color(0.95, 0.76, 0.3, 0.6), R, false)
+		for g in base.gems:
+			if not g["taken"]:
+				var p: Vector3 = g["node"].position
+				var s: Vector2 = to_screen.call(p.x, p.z)
+				if s.length() < R:
+					_dot(c, s, 4.0, g["col"], R, false)
+		for p in base.prizes:
+			if not p["taken"]:
+				var pp: Vector3 = p["node"].position
+				_dot(c, to_screen.call(pp.x, pp.z), 5.0, Color("ffd24a"), R, true)
+		if not base.in_rover:
+			_dot(c, to_screen.call(base.r_pos.x, base.r_pos.z), 5.0, Color("ff7a3a"), R, true)
+		for t in base.m_targets:
+			_dot(c, to_screen.call(t.x, t.y), 7.0, Color("5fd3c4"), R, true)
+		var h: float = base.rover.heading if base.in_rover else base.p_heading
+		var dir := Vector2(sin(h), cos(h)).rotated(ang)
+		var a := dir.angle()
+		var pts := PackedVector2Array([c + Vector2(12, 0).rotated(a), c + Vector2(-8, -8).rotated(a), c + Vector2(-3, 0).rotated(a), c + Vector2(-8, 8).rotated(a)])
+		draw_colored_polygon(pts, Color.WHITE)
+		draw_arc(c, R - 1.0, 0, TAU, 64, Color(1, 1, 1, 0.4), 2.0)
+
+	func _dot(c: Vector2, p: Vector2, r: float, col: Color, R: float, clamp_edge: bool) -> void:
+		var q := p
+		if q.length() > R - 8.0:
+			if not clamp_edge:
+				if q.length() > R + r:
+					return
+			else:
+				q = q.normalized() * (R - 8.0)
+		if clamp_edge:
+			draw_rect(Rect2(c + q - Vector2(r, r), Vector2(r, r) * 2.0), col)
+		else:
+			draw_circle(c + q, r, col)
+
+
+# ======================================================================
+# Orbit view: Mars, moons, stars, interior cutaway, Gale pin
+# ======================================================================
+class OrbitWorld extends Node3D:
+	const NOISE_LIB := """
+	float hash(vec3 p){ p = fract(p*0.3183099 + vec3(0.11,0.17,0.13)); p *= 17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+	float vnoise(vec3 x){ vec3 i = floor(x); vec3 f = fract(x); f = f*f*(3.0-2.0*f);
+		return mix(mix(mix(hash(i), hash(i+vec3(1.0,0.0,0.0)), f.x), mix(hash(i+vec3(0.0,1.0,0.0)), hash(i+vec3(1.0,1.0,0.0)), f.x), f.y),
+			mix(mix(hash(i+vec3(0.0,0.0,1.0)), hash(i+vec3(1.0,0.0,1.0)), f.x), mix(hash(i+vec3(0.0,1.0,1.0)), hash(i+vec3(1.0,1.0,1.0)), f.x), f.y), f.z); }
+	float fbm(vec3 p){ float s = 0.0; float a = 0.5; for (int i = 0; i < 5; i++){ s += a*vnoise(p); p *= 2.03; a *= 0.5; } return s/0.96875; }
+	"""
+
+	const MARS_SHADER := """
+	shader_type spatial;
+	uniform bool cut = false;
+	uniform vec3 n0 = vec3(1.0,0.0,0.0);
+	uniform vec3 n1 = vec3(0.0,1.0,0.0);
+	uniform vec3 n2 = vec3(0.0,0.0,1.0);
+	uniform vec3 gale_dir = vec3(0.0,0.0,1.0);
+	varying vec3 objp;
+	varying vec3 wpos;
+	%s
+	vec3 h3(vec3 p){ return fract(sin(vec3(dot(p,vec3(127.1,311.7,74.7)), dot(p,vec3(269.5,183.3,246.1)), dot(p,vec3(113.5,271.9,124.6))))*43758.5453); }
+	float craters(vec3 p){
+		vec3 i = floor(p); vec3 f = fract(p); float res = 0.0;
+		for (int x = -1; x <= 1; x++) { for (int y = -1; y <= 1; y++) { for (int z = -1; z <= 1; z++) {
+			vec3 g = vec3(float(x), float(y), float(z)); vec3 o = h3(i + g);
+			if (o.y > 0.5) { continue; }
+			float rad = 0.12 + 0.25*o.x; float d = length(g + o - f);
+			res += smoothstep(rad*0.75, rad, d)*(1.0 - smoothstep(rad, rad*1.25, d))*0.6 - (1.0 - smoothstep(rad*0.55, rad*0.85, d))*0.35;
+		}}}
+		return res;
+	}
+	void vertex(){ objp = VERTEX; wpos = (MODEL_MATRIX*vec4(VERTEX,1.0)).xyz; }
+	void fragment(){
+		if (cut && dot(wpos,n0) > 0.0 && dot(wpos,n1) > 0.0 && dot(wpos,n2) > 0.0) { discard; }
+		vec3 p = normalize(objp);
+		float n = fbm(p*1.8 + vec3(7.1,3.3,1.7));
+		float d = fbm(p*7.0 + vec3(2.0,9.0,4.0));
+		float dark = smoothstep(0.5, 0.62, n + (d - 0.5)*0.15);
+		vec3 col = vec3(0.80 - 0.37*dark, 0.41 - 0.20*dark, 0.22 - 0.10*dark);
+		col += (d - 0.5)*vec3(0.24, 0.15, 0.10);
+		col += craters(p*9.0)*vec3(0.10, 0.06, 0.04) + craters(p*21.0 + vec3(3.0))*vec3(0.05, 0.03, 0.02);
+		float lat = degrees(asin(clamp(p.y, -1.0, 1.0)));
+		float lon = degrees(atan(-p.z, p.x));
+		if (lon > -100.0 && lon < -35.0) {
+			float c = -9.0 + 3.0*sin(lon*0.12);
+			float w = 1.0 + 1.8*smoothstep(-100.0, -65.0, lon)*(1.0 - smoothstep(-55.0, -35.0, lon));
+			float k = clamp(1.0 - abs(lat - c)/w, 0.0, 1.0);
+			col -= vec3(0.20, 0.11, 0.05)*k;
+		}
+		float gd = degrees(acos(clamp(dot(p, gale_dir), -1.0, 1.0)));
+		col += vec3(0.09, 0.05, 0.0)*exp(-pow((gd - 2.2)/0.35, 2.0));
+		if (gd < 1.9) { col -= vec3(0.06, 0.04, 0.0); }
+		float cap = max(smoothstep(76.0, 80.0, lat + (d - 0.5)*9.0), smoothstep(77.0, 82.0, -lat + (d - 0.5)*9.0));
+		col = mix(col, vec3(0.96, 0.93, 0.90), cap);
+		ALBEDO = clamp(col, 0.0, 1.0);
+		ROUGHNESS = 0.95;
+		SPECULAR = 0.15;
+	}
+	"""
+
+	const ATMO_SHADER := """
+	shader_type spatial;
+	render_mode unshaded, blend_add, depth_draw_never, cull_back;
+	void fragment(){ float f = pow(1.0 - clamp(dot(NORMAL, VIEW), 0.0, 1.0), 3.0); ALBEDO = vec3(1.0, 0.55, 0.35)*f*1.2; ALPHA = f; }
+	"""
+
+	const MOON_SHADER := """
+	shader_type spatial;
+	uniform float seed = 1.0;
+	%s
+	void vertex(){ VERTEX *= 0.72 + 0.55*fbm(VERTEX*1.6 + vec3(seed)); }
+	void fragment(){ ALBEDO = vec3(0.55, 0.48, 0.43); ROUGHNESS = 1.0; }
+	"""
+
+	const SKY_SHADER := """
+	shader_type sky;
+	float hs(vec3 p){ p = fract(p*0.3183099 + vec3(0.11,0.17,0.13)); p *= 17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+	void sky(){
+		vec3 d = EYEDIR;
+		vec3 cell = floor(d*320.0);
+		float h = hs(cell);
+		float star = step(0.9965, h)*(0.35 + 0.65*hs(cell + 3.1));
+		vec3 tint = mix(vec3(0.75, 0.82, 1.0), vec3(1.0, 0.86, 0.7), hs(cell + 7.7));
+		float band = exp(-pow(dot(d, normalize(vec3(0.35, 1.0, 0.25))), 2.0)*28.0);
+		vec3 c = tint*star + vec3(0.05, 0.04, 0.07)*band + vec3(0.008, 0.006, 0.014);
+		if (LIGHT0_ENABLED) {
+			float s = max(dot(d, LIGHT0_DIRECTION), 0.0);
+			c += vec3(1.0, 0.93, 0.8)*pow(s, 900.0)*6.0 + vec3(1.0, 0.7, 0.45)*pow(s, 60.0)*0.25;
+		}
+		COLOR = c;
+	}
+	"""
+
+	var main
+	var world_env: WorldEnvironment
+	var env_res: Environment
+	var cam: Camera3D
+	var tilt: Node3D
+	var spin: Node3D
+	var mars: MeshInstance3D
+	var mars_mat: ShaderMaterial
+	var atmo: MeshInstance3D
+	var caps: Node3D
+	var pin: Node3D
+	var pin_ring: MeshInstance3D
+	var pin_label: Label3D
+	var phobos_pivot: Node3D
+	var deimos_pivot: Node3D
+	var moon_labels: Array = []
+	var sun_dir := Vector3(0.75, 0.25, 0.62).normalized()
+	var gale_dir: Vector3
+
+	var theta := 0.15
+	var phi := 1.3
+	var radius := 12.0
+	var t_theta := 0.15
+	var t_phi := 1.3
+	var t_radius := 6.5
+	var spin_paused := false
+	var spin_target = null
+	var cut := false
+	var flying = null
+	var touches := {}
+	var pinch_d := 0.0
+	var last_tap := 0.0
+
+	const S_DIAG := Vector3(0.57735, 0.57735, 0.57735)
+
+	static func ll2v(lat_deg: float, lon_deg: float) -> Vector3:
+		var la := deg_to_rad(lat_deg)
+		var lo := deg_to_rad(lon_deg)
+		return Vector3(cos(la) * cos(lo), sin(la), -cos(la) * sin(lo))
+
+	func _ready() -> void:
+		var env := Environment.new()
+		env.background_mode = Environment.BG_SKY
+		var sky := Sky.new()
+		var sm := ShaderMaterial.new()
+		var sh := Shader.new()
+		sh.code = SKY_SHADER
+		sm.shader = sh
+		sky.sky_material = sm
+		env.sky = sky
+		env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+		env.ambient_light_color = Color("3a2a33")
+		env.ambient_light_energy = 0.6
+		env.tonemap_mode = Environment.TONE_MAPPER_FILMIC
+		world_env = WorldEnvironment.new()
+		world_env.environment = env
+		env_res = env
+		add_child(world_env)
+		var sun := DirectionalLight3D.new()
+		sun.light_color = Color("fff1e2")
+		sun.light_energy = 1.4
+		add_child(sun)
+		sun.look_at_from_position(sun_dir * 10.0, Vector3.ZERO, Vector3.UP)
+
+		cam = Camera3D.new()
+		cam.fov = 45
+		cam.near = 0.01
+		cam.far = 3000
+		add_child(cam)
+
+		tilt = Node3D.new()
+		tilt.rotation.z = deg_to_rad(25.19)
+		add_child(tilt)
+		spin = Node3D.new()
+		tilt.add_child(spin)
+
+		gale_dir = ll2v(-5.4, 137.8)
+		var smesh := SphereMesh.new()
+		smesh.radius = 1.0
+		smesh.height = 2.0
+		smesh.radial_segments = 128
+		smesh.rings = 64
+		mars_mat = ShaderMaterial.new()
+		var msh := Shader.new()
+		msh.code = MARS_SHADER % NOISE_LIB
+		mars_mat.shader = msh
+		mars_mat.set_shader_parameter("gale_dir", gale_dir)
+		mars = Mk.mi(spin, smesh, mars_mat)
+
+		var amesh := SphereMesh.new()
+		amesh.radius = 1.045
+		amesh.height = 2.09
+		amesh.radial_segments = 64
+		amesh.rings = 32
+		var am := ShaderMaterial.new()
+		var ash := Shader.new()
+		ash.code = ATMO_SHADER
+		am.shader = ash
+		atmo = Mk.mi(self, amesh, am)
+
+		_build_caps()
+		_build_pin()
+		_build_moons()
+
+	func _build_caps() -> void:
+		caps = Node3D.new()
+		caps.visible = false
+		add_child(caps)
+		var cm := StandardMaterial3D.new()
+		cm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		cm.vertex_color_use_as_albedo = true
+		cm.cull_mode = BaseMaterial3D.CULL_DISABLED
+		var layers := [[0.82, 1.0, Color("8c4a2c"), Color("b86a43")], [0.5, 0.82, Color("ff8a2a"), Color("a8401a")], [0.0, 0.5, Color("fff1a8"), Color("ffa630")]]
+		var shades := [1.0, 0.8, 0.64]
+		var st := SurfaceTool.new()
+		st.begin(Mesh.PRIMITIVE_TRIANGLES)
+		var segs := 40
+		var rsegs := 6
+		for face in 3:
+			for L in layers:
+				var r0: float = L[0]
+				var r1: float = L[1]
+				for i in segs:
+					for j in rsegs:
+						var quad := []
+						for q in [[i, j], [i + 1, j], [i + 1, j + 1], [i, j], [i + 1, j + 1], [i, j + 1]]:
+							var a: float = (PI / 2.0) * q[0] / segs
+							var rr: float = lerp(r0, r1, float(q[1]) / rsegs)
+							var x := cos(a) * rr
+							var y := sin(a) * rr
+							var v := Vector3(x, y, 0.0)
+							if face == 1:
+								v = Vector3(0.0, y, x)
+							elif face == 2:
+								v = Vector3(x, 0.0, y)
+							var t := 0.0 if r1 == r0 else (rr - r0) / (r1 - r0)
+							var c: Color = L[2].lerp(L[3], t) * shades[face]
+							c.a = 1.0
+							st.set_color(c)
+							st.add_vertex(v)
+		Mk.mi(caps, st.commit(), cm)
+		var specs := [["Crust", "24–72 km thick", Vector3(0.66, 0.03, 0.62), Color("e0a07a")], ["Mantle", "~1,550 km thick", Vector3(0.03, 0.47, 0.47), Color("ff9a4a")], ["Core", "liquid iron", Vector3(0.24, 0.03, 0.24), Color("ffd36a")]]
+		for s in specs:
+			var l := Mk.label(caps, "%s\n%s" % [s[0], s[1]], s[2], 40, s[3], 0.0011)
+			l.no_depth_test = true
+			l.render_priority = 10
+
+	func _build_pin() -> void:
+		pin = Node3D.new()
+		pin.position = gale_dir
+		pin.quaternion = Quaternion(Vector3.UP, gale_dir)
+		spin.add_child(pin)
+		Mk.cyl(pin, 0.004, 0.004, 0.12, Mk.unshaded(Color("fff0c8")), Vector3(0, 0.06, 0), 8)
+		Mk.sphere(pin, 0.022, Mk.unshaded(Color("ffd24a")), Vector3(0, 0.125, 0), 12)
+		pin_ring = Mk.torus(pin, 0.036, 0.006, Mk.unshaded(Color("ffd24a"), 0.9), Vector3(0, 0.004, 0))
+		pin_label = Mk.label(pin, "Gale Crater\ndouble-click to land", Vector3(0, 0.23, 0), 40, Color("ffd24a"), 0.0018)
+		pin_label.no_depth_test = true
+		pin_label.render_priority = 10
+
+	func _build_moons() -> void:
+		phobos_pivot = Node3D.new()
+		deimos_pivot = Node3D.new()
+		tilt.add_child(phobos_pivot)
+		tilt.add_child(deimos_pivot)
+		deimos_pivot.rotation.y = 2.2
+		var data := [[phobos_pivot, 1.9, 0.085, 3.0, "Phobos"], [deimos_pivot, 3.4, 0.055, 9.0, "Deimos"]]
+		for d in data:
+			var mm := ShaderMaterial.new()
+			var msh := Shader.new()
+			msh.code = MOON_SHADER % NOISE_LIB
+			mm.shader = msh
+			mm.set_shader_parameter("seed", d[3])
+			var s := SphereMesh.new()
+			s.radius = 1.0
+			s.height = 2.0
+			var m := Mk.mi(d[0], s, mm, Vector3(d[1], 0, 0))
+			m.scale = Vector3(d[2] * 1.35, d[2], d[2] * 1.1)
+			var l := Mk.label(d[0], d[4], Vector3(d[1], 0.17, 0), 40, Color("c9b8ab"), 0.0026)
+			moon_labels.append(l)
+			tilt.add_child(Mk.circle_lines(d[1], Color(1.0, 0.69, 0.54, 0.3)))
+
+	func activate(on: bool) -> void:
+		visible = on
+		world_env.environment = env_res if on else null
+		process_mode = Node.PROCESS_MODE_INHERIT if on else Node.PROCESS_MODE_DISABLED
+		cam.current = on
+
+	func pin_world() -> Vector3:
+		return pin.global_position
+
+	func _process(dt: float) -> void:
+		var t := Time.get_ticks_msec() / 1000.0
+		if spin_target != null:
+			spin.rotation.y = lerp(spin.rotation.y, float(spin_target), 1.0 - exp(-dt * 3.0))
+			if abs(spin.rotation.y - float(spin_target)) < 0.002:
+				spin_target = null
+		elif not spin_paused:
+			spin.rotation.y += dt * TAU / 45.0
+		phobos_pivot.rotation.y += dt * TAU / 14.0
+		deimos_pivot.rotation.y += dt * TAU / 56.0
+		var ph := fmod(t * 1.1, 1.0)
+		pin_ring.scale = Vector3.ONE * (1.0 + ph * 0.9)
+
+		if flying != null:
+			flying["t"] = min(1.0, flying["t"] + dt / 1.8)
+			var f: float = flying["t"]
+			var e := 2.0 * f * f if f < 0.5 else 1.0 - pow(-2.0 * f + 2.0, 2.0) / 2.0
+			var pw := pin_world()
+			var from_dir: Vector3 = flying["from"].normalized()
+			var to_dir := pw.normalized()
+			var q := Quaternion(from_dir, to_dir) if from_dir.dot(to_dir) > -0.999 else Quaternion(Vector3.UP, PI)
+			var qt := Quaternion.IDENTITY.slerp(q, e)
+			var r: float = lerp(flying["from"].length(), 1.7, e)
+			cam.position = (qt * from_dir) * r
+			cam.look_at(Vector3.ZERO.lerp(pw, e), Vector3.UP)
+			if f >= 0.88 and not flying["done"]:
+				flying["done"] = true
+				main.fade(main.enter_base)
+		else:
+			var k := 1.0 - exp(-dt * 7.0)
+			theta = lerp(theta, t_theta, k)
+			phi = lerp(phi, t_phi, k)
+			radius = lerp(radius, t_radius, 1.0 - exp(-dt * 3.5))
+			cam.position = Vector3(radius * sin(phi) * sin(theta), radius * cos(phi), radius * sin(phi) * cos(theta))
+			cam.look_at(Vector3.ZERO, Vector3.UP)
+			var want_cut := radius < 3.0
+			if want_cut != cut:
+				set_cut(want_cut)
+
+		if cut:
+			var d := cam.position.normalized()
+			var side := Vector3.UP.cross(d)
+			if side.length() < 0.01:
+				side = Vector3.RIGHT
+			side = side.normalized()
+			d = d.rotated(Vector3.UP, 0.55).rotated(side, -0.3).normalized()
+			var q := Quaternion(S_DIAG, d)
+			caps.quaternion = q
+			mars_mat.set_shader_parameter("n0", q * Vector3.RIGHT)
+			mars_mat.set_shader_parameter("n1", q * Vector3.UP)
+			mars_mat.set_shader_parameter("n2", q * Vector3.BACK)
+
+		var pw2 := pin_world()
+		var vis := pw2.normalized().dot((cam.position - pw2).normalized()) > 0.06
+		if cut:
+			var q2 := caps.quaternion
+			if pw2.dot(q2 * Vector3.RIGHT) > 0 and pw2.dot(q2 * Vector3.UP) > 0 and pw2.dot(q2 * Vector3.BACK) > 0:
+				vis = false
+		if flying != null and flying["t"] > 0.55:
+			vis = false
+		pin_label.visible = vis
+		pin.visible = vis or not cut
+		if flying != null and flying["t"] > 0.55:
+			pin.visible = false
+
+	func set_cut(c: bool) -> void:
+		cut = c
+		caps.visible = c
+		atmo.visible = not c
+		for l in moon_labels:
+			l.visible = not c
+		mars_mat.set_shader_parameter("cut", c)
+		main.ui.set_fact_mode(c)
+
+	func toggle_inside() -> void:
+		var portrait := get_viewport().get_visible_rect().size.y > get_viewport().get_visible_rect().size.x
+		t_radius = 6.5 if cut else (2.75 if portrait else 2.3)
+
+	func best_spin_angle() -> float:
+		var cur := spin.rotation.y
+		var best := cur
+		var bd := -2.0
+		for i in 120:
+			var a := cur + TAU * i / 120.0
+			spin.rotation.y = a
+			var d := pin.global_position.normalized().dot(sun_dir)
+			if d > bd:
+				bd = d
+				best = a
+		spin.rotation.y = cur
+		return cur + wrapf(best - cur, -PI, PI)
+
+	func aim_at_pin(r: float) -> void:
+		var d := pin_world().normalized()
+		var th := atan2(d.x, d.z)
+		t_theta = theta + wrapf(th - theta, -PI, PI)
+		t_phi = clamp(acos(d.y), 0.2, PI - 0.2)
+		t_radius = r
+
+	func find_gale() -> void:
+		spin_paused = true
+		spin_target = null
+		spin.rotation.y = best_spin_angle()
+		aim_at_pin(3.6)
+		main.toast("Double-click (or double-tap) the glowing pin to land")
+
+	func fly_to_gale() -> void:
+		if flying != null:
+			return
+		spin_paused = true
+		if cut:
+			set_cut(false)
+		spin_target = best_spin_angle()
+		flying = {"t": 0.0, "from": cam.position, "done": false}
+		main.ui.set_orbit_hint("Descending to Gale Crater…")
+
+	func reset_after_base() -> void:
+		flying = null
+		spin_paused = false
+		spin_target = null
+		spin.rotation.y = best_spin_angle()
+		var d := pin_world().normalized()
+		theta = atan2(d.x, d.z)
+		t_theta = theta
+		phi = clamp(acos(d.y), 0.2, PI - 0.2)
+		t_phi = phi
+		radius = 3.1
+		t_radius = 6.5
+		main.ui.set_orbit_hint("")
+
+	func _pin_hit(screen: Vector2) -> bool:
+		if not pin_label.visible:
+			return false
+		var pw := pin_world()
+		if cam.is_position_behind(pw):
+			return false
+		var sp := cam.unproject_position(pw + pw.normalized() * 0.1)
+		return sp.distance_to(screen) < 60.0
+
+	func _try_land(screen: Vector2) -> void:
+		if _pin_hit(screen):
+			fly_to_gale()
+
+	func _unhandled_input(ev: InputEvent) -> void:
+		if flying != null:
+			return
+		var touch := DisplayServer.is_touchscreen_available()
+		if ev is InputEventMouseButton:
+			if ev.button_index == MOUSE_BUTTON_WHEEL_UP and ev.pressed:
+				t_radius = clamp(t_radius * 0.9, 1.75, 14.0)
+			elif ev.button_index == MOUSE_BUTTON_WHEEL_DOWN and ev.pressed:
+				t_radius = clamp(t_radius * 1.1, 1.75, 14.0)
+			elif ev.button_index == MOUSE_BUTTON_LEFT and ev.pressed and ev.double_click:
+				_try_land(ev.position)
+			elif ev.button_index == MOUSE_BUTTON_LEFT and ev.pressed and _pin_hit(ev.position):
+				main.toast("Double-click the pin to land")
+		elif ev is InputEventMouseMotion and not touch:
+			if ev.button_mask & MOUSE_BUTTON_MASK_LEFT:
+				t_theta -= ev.relative.x * 0.006
+				t_phi = clamp(t_phi - ev.relative.y * 0.006, 0.15, PI - 0.15)
+		elif ev is InputEventScreenTouch:
+			if ev.pressed:
+				touches[ev.index] = ev.position
+				if ev.double_tap:
+					_try_land(ev.position)
+			else:
+				touches.erase(ev.index)
+			pinch_d = 0.0
+		elif ev is InputEventScreenDrag:
+			touches[ev.index] = ev.position
+			if touches.size() >= 2:
+				var k := touches.keys()
+				var d: float = touches[k[0]].distance_to(touches[k[1]])
+				if pinch_d > 0.0 and d > 0.0:
+					t_radius = clamp(t_radius * pinch_d / d, 1.75, 14.0)
+				pinch_d = d
+			else:
+				t_theta -= ev.relative.x * 0.006
+				t_phi = clamp(t_phi - ev.relative.y * 0.006, 0.15, PI - 0.15)
+		elif ev is InputEventMagnifyGesture:
+			t_radius = clamp(t_radius / ev.factor, 1.75, 14.0)
+
+
+# ======================================================================
+# Gale Crater base: terrain, buildings, player, rover, gems, missions, daily life
+# ======================================================================
+class BaseWorld extends Node3D:
+	const HUB_R := 9.0
+	const DOOR_HALF := 0.2
+	const GRAVITY := 3.71
+
+	var main
+	var world_env: WorldEnvironment
+	var env_res: Environment
+	var cam: Camera3D
+	var avatar: Node3D
+	var rover: Node3D
+	var obstacles: Array = []
+	var labels: Array = []
+	var gems: Array = []
+	var prizes: Array = []
+
+	# player
+	var p_pos := Vector3(18, 0, -1)
+	var p_vy := 0.0
+	var p_ground := true
+	var p_heading := PI / 2.0
+	var in_rover := false
+	var walk_t := 0.0
+	var o2 := 100.0
+	var energy := 100.0
+	var r_pos := Vector3(45, 0.2, 0)
+
+	# camera
+	var cam_yaw := -PI / 2.0 + 0.6
+	var cam_pitch := 0.32
+	var cam_dist := 7.0
+	var cam_dist_t := 7.0
+	var last_drag := -10.0
+
+	var customizing := false
+	var busy := false
+	var jump_queued := false
+	var gems_got := 0
+	var prizes_got := 0
+	var prize_nag := 0.0
+	var o2_warned := false
+	var en_warned := false
+	var o2_resetting := false
+	var rover_hinted := false
+	var daily_dirty := false
+	var daily_persist_t := 0.0
+	var tracker_t := 0.0
+	var current_action := ""
+
+	# missions
+	var mres := {}
+	var m_group: Node3D
+	var m_items: Array = []
+	var m_targets: Array = []
+	var m_labels: Array = []
+	var trophies := {}
+	var heli_anim = null
+	var drill_anim = null
+	var asm = null
+	var gh_centers: Array = []
+
+	func _ready() -> void:
+		_build_environment()
+		_build_terrain()
+		_build_hub()
+		_build_outside()
+		_build_greenhouses()
+		_build_garage()
+		rover = Rover.new()
+		add_child(rover)
+		rover.heading = -PI / 2.0
+		avatar = Avatar.new()
+		add_child(avatar)
+		avatar.build(main.save["cfg"])
+		m_group = Node3D.new()
+		add_child(m_group)
+		spawn_collectibles()
+		_resolve_missions()
+		for k in [1, 3, 5, 7]:
+			gh_centers.append(Vector2(cos(k * PI / 4.0) * 24.0, sin(k * PI / 4.0) * 24.0))
+		apply_trophies()
+		build_step_objects()
+		p_pos.y = ground_at(p_pos.x, p_pos.z)
+
+	func activate(on: bool) -> void:
+		visible = on
+		world_env.environment = env_res if on else null
+		process_mode = Node.PROCESS_MODE_INHERIT if on else Node.PROCESS_MODE_DISABLED
+		cam.current = on
+
+	# ------------------------------------------------------------------ world
+	func _build_environment() -> void:
+		var env := Environment.new()
+		env.background_mode = Environment.BG_SKY
+		var sky := Sky.new()
+		var psm := ProceduralSkyMaterial.new()
+		psm.sky_top_color = Color("9a5a3e")
+		psm.sky_horizon_color = Color("d9a27c")
+		psm.ground_horizon_color = Color("d9a27c")
+		psm.ground_bottom_color = Color("7a4a32")
+		psm.sun_angle_max = 15.0
+		sky.sky_material = psm
+		env.sky = sky
+		env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
+		env.ambient_light_energy = 0.6
+		env.fog_enabled = true
+		env.fog_light_color = Color("d9a27c")
+		env.fog_density = 0.0035
+		env.fog_sky_affect = 0.2
+		env.tonemap_mode = Environment.TONE_MAPPER_FILMIC
+		world_env = WorldEnvironment.new()
+		world_env.environment = env
+		env_res = env
+		add_child(world_env)
+		var sun := DirectionalLight3D.new()
+		sun.light_color = Color("fff0dd")
+		sun.light_energy = 1.25
+		sun.shadow_enabled = true
+		sun.directional_shadow_max_distance = 110.0
+		add_child(sun)
+		sun.look_at_from_position(Vector3(45, 55, -70), Vector3.ZERO, Vector3.UP)
+		cam = Camera3D.new()
+		cam.fov = 60
+		cam.near = 0.1
+		cam.far = 2500
+		add_child(cam)
+
+	func terrain_h(x: float, z: float) -> float:
+		var d := sqrt(x * x + z * z)
+		var h := 2.2 * sin(x * 0.045 + 0.5) * cos(z * 0.038) + 4.5 * sin(x * 0.013 + 1.7) * cos(z * 0.017 + 0.4) + 1.1 * sin(x * 0.11) * sin(z * 0.09) + 0.5 * sin(x * 0.31 + z * 0.23)
+		h = (h + 3.0) * smoothstep(58.0, 120.0, d)
+		var mx := x - 60.0
+		var mz := z + 330.0
+		h += 150.0 * exp(-(mx * mx + mz * mz) / (2.0 * 95.0 * 95.0)) * smoothstep(80.0, 180.0, d)
+		h += smoothstep(360.0, 460.0, d) * 55.0
+		return h
+
+	func ground_at(x: float, z: float) -> float:
+		var d := sqrt(x * x + z * z)
+		if d < HUB_R:
+			return 0.3
+		if x > 36.0 and x < 52.0 and abs(z) < 7.0:
+			return max(0.2, terrain_h(x, z))
+		return terrain_h(x, z)
+
+	func _build_terrain() -> void:
+		var size := 1000.0
+		var seg := 160
+		var noise := FastNoiseLite.new()
+		noise.frequency = 0.02
+		var st := SurfaceTool.new()
+		st.begin(Mesh.PRIMITIVE_TRIANGLES)
+		for j in seg + 1:
+			for i in seg + 1:
+				var x := -size / 2.0 + size * i / seg
+				var z := -size / 2.0 + size * j / seg
+				var h := terrain_h(x, z)
+				var n := noise.get_noise_2d(x, z)
+				var c := Color(0.70 + 0.07 * n, 0.37 + 0.05 * n, 0.21 + 0.03 * n)
+				c = c * (0.9 + 0.1 * clamp(h / 12.0, -1.0, 1.0))
+				c.a = 1.0
+				st.set_color(c)
+				st.add_vertex(Vector3(x, h, z))
+		for j in seg:
+			for i in seg:
+				var a := j * (seg + 1) + i
+				var b := a + 1
+				var c2 := a + seg + 1
+				var d2 := c2 + 1
+				st.add_index(a)
+				st.add_index(b)
+				st.add_index(c2)
+				st.add_index(b)
+				st.add_index(d2)
+				st.add_index(c2)
+		st.generate_normals()
+		var m := StandardMaterial3D.new()
+		m.vertex_color_use_as_albedo = true
+		m.roughness = 1.0
+		m.cull_mode = BaseMaterial3D.CULL_DISABLED
+		Mk.mi(self, st.commit(), m)
+		# rocks
+		var rng := RandomNumberGenerator.new()
+		rng.seed = 7
+		var rock := SphereMesh.new()
+		rock.radius = 0.5
+		rock.height = 1.0
+		rock.radial_segments = 7
+		rock.rings = 3
+		var mm := MultiMesh.new()
+		mm.transform_format = MultiMesh.TRANSFORM_3D
+		mm.mesh = rock
+		mm.instance_count = 320
+		for i in 320:
+			var x := 0.0
+			var z := 0.0
+			while true:
+				x = rng.randf_range(-320, 320)
+				z = rng.randf_range(-320, 320)
+				if sqrt(x * x + z * z) >= 26.0 and not (x > 32 and x < 56 and abs(z) < 11):
+					break
+			var sc := 0.25 + pow(rng.randf(), 3.0) * 2.2
+			var basis := Basis.from_euler(Vector3(rng.randf() * 3.0, rng.randf() * 3.0, rng.randf() * 3.0)).scaled(Vector3(sc * (0.8 + rng.randf() * 0.6), sc * 0.6, sc * (0.8 + rng.randf() * 0.6)))
+			mm.set_instance_transform(i, Transform3D(basis, Vector3(x, terrain_h(x, z) + sc * 0.1, z)))
+		var mmi := MultiMeshInstance3D.new()
+		mmi.multimesh = mm
+		mmi.material_override = Mk.mat(Color("6e3a24"), 1.0)
+		add_child(mmi)
+		var mt := Mk.label(self, "Mount Sharp\n5.5 km peak in Gale’s centre", Vector3(60, 175, -330), 64, Color("ffcfa6"), 0.15)
+		mt.no_depth_test = false
+
+	func add_label(text: String, pos: Vector3, color := Color.WHITE, size := 64) -> Label3D:
+		var l := Mk.label(self, text, pos, size, color, 0.009)
+		l.visibility_range_begin = 9.0
+		l.visibility_range_end = 95.0
+		labels.append(l)
+		return l
+
+	# ------------------------------------------------------------------ collision
+	func add_c(x: float, z: float, r: float, rover_only := false) -> void:
+		obstacles.append({"t": "c", "x": x, "z": z, "r": r, "ro": rover_only})
+
+	func add_s(ax: float, az: float, bx: float, bz: float, r: float) -> void:
+		obstacles.append({"t": "s", "ax": ax, "az": az, "bx": bx, "bz": bz, "r": r, "ro": false})
+
+	## Pushes position p (Vector3, x/z used) out of obstacles. Returns true if it hit something.
+	func resolve(p: Vector3, r: float, is_rover: bool) -> Array:
+		var hit := false
+		for o in obstacles:
+			if o["ro"] and not is_rover:
+				continue
+			match o["t"]:
+				"c":
+					var dx: float = p.x - o["x"]
+					var dz: float = p.z - o["z"]
+					var d := sqrt(dx * dx + dz * dz)
+					var m: float = o["r"] + r
+					if d < m and d > 0.0001:
+						p.x = o["x"] + dx / d * m
+						p.z = o["z"] + dz / d * m
+						hit = true
+				"s":
+					var abx: float = o["bx"] - o["ax"]
+					var abz: float = o["bz"] - o["az"]
+					var t: float = clamp(((p.x - o["ax"]) * abx + (p.z - o["az"]) * abz) / (abx * abx + abz * abz), 0.0, 1.0)
+					var cx: float = o["ax"] + abx * t
+					var cz: float = o["az"] + abz * t
+					var dx2 := p.x - cx
+					var dz2 := p.z - cz
+					var d2 := sqrt(dx2 * dx2 + dz2 * dz2)
+					var m2: float = o["r"] + r
+					if d2 < m2 and d2 > 0.0001:
+						p.x = cx + dx2 / d2 * m2
+						p.z = cz + dz2 / d2 * m2
+						hit = true
+				"ring":
+					var d3 := sqrt(p.x * p.x + p.z * p.z)
+					if abs(d3 - HUB_R) < r + 0.15 and d3 > 0.0001:
+						var a := atan2(p.z, p.x)
+						if abs(wrapf(a, -PI, PI)) > DOOR_HALF * 0.82:
+							var nd := HUB_R - r - 0.15 if d3 < HUB_R else HUB_R + r + 0.15
+							p.x = p.x / d3 * nd
+							p.z = p.z / d3 * nd
+							hit = true
+		var dd := sqrt(p.x * p.x + p.z * p.z)
+		if dd > 440.0:
+			p.x *= 440.0 / dd
+			p.z *= 440.0 / dd
+		return [p, hit]
+
+	func free_spot(x: float, z: float, r: float) -> bool:
+		if sqrt(x * x + z * z) < 14.0:
+			return false
+		if x > 32 and x < 56 and abs(z) < 11:
+			return false
+		return not resolve(Vector3(x, 0, z), r, true)[1]
+
+	func spot(deg: float, r: float) -> Vector2:
+		for k in 48:
+			var sgn := 1.0 if k % 2 == 1 else -1.0
+			var a := deg_to_rad(deg + sgn * ceilf(k / 2.0) * 6.0)
+			var rr := r + floorf(k / 4.0) * 2.0
+			var x := cos(a) * rr
+			var z := sin(a) * rr
+			if free_spot(x, z, 2.6):
+				return Vector2(x, z)
+		return Vector2(cos(deg_to_rad(deg)) * r, sin(deg_to_rad(deg)) * r)
+
+	func cluster(deg: float, r: float, n: int, spread: float) -> Array:
+		var c := spot(deg, r)
+		var out: Array = []
+		var rng := RandomNumberGenerator.new()
+		rng.seed = int(deg * 31 + r * 7)
+		for i in n:
+			var p := c
+			for k in 40:
+				var a := rng.randf() * TAU
+				var d := spread * (0.45 + rng.randf() * 0.55)
+				var q := c + Vector2(cos(a), sin(a)) * d
+				var ok := free_spot(q.x, q.y, 1.3)
+				for o in out:
+					if o.distance_to(q) < 2.5:
+						ok = false
+				if ok:
+					p = q
+					break
+			out.append(p)
+		return out
+
+	# ------------------------------------------------------------------ buildings
+	func _build_hub() -> void:
+		var white := Mk.mat(Color("ece7e0"), 0.55, 0.1)
+		var orange := Mk.mat(Color("e0632c"), 0.5, 0.1)
+		var grey := Mk.mat(Color("9aa0a8"), 0.5, 0.35)
+		var dark := Mk.mat(Color("2c3038"), 0.6, 0.3)
+		Mk.cyl(self, HUB_R + 0.3, HUB_R + 0.5, 0.3, Mk.mat(Color("7b7f86"), 0.8, 0.2), Vector3(0, 0.15, 0), 48)
+		var segs := 56
+		var seg_w := TAU * HUB_R / segs + 0.06
+		for i in segs:
+			var a := TAU * (i + 0.5) / segs
+			if abs(wrapf(a, -PI, PI)) < DOOR_HALF + PI / segs:
+				continue
+			var w := Mk.box(self, Vector3(seg_w, 2.6, 0.25), white, Vector3(cos(a) * HUB_R, 1.6, sin(a) * HUB_R))
+			w.rotation.y = PI / 2.0 - a
+			var s := Mk.box(self, Vector3(seg_w, 0.25, 0.27), orange, Vector3(cos(a) * (HUB_R + 0.02), 2.2, sin(a) * (HUB_R + 0.02)))
+			s.rotation.y = PI / 2.0 - a
+		Mk.sphere(self, HUB_R, Mk.glass(), Vector3(0, 2.9, 0), 48, true)
+		for i in 6:
+			var rib := Mk.torus(self, HUB_R, 0.07, white, Vector3(0, 2.9, 0))
+			rib.rotation = Vector3(PI / 2.0, i * PI / 6.0, 0)
+			rib.rotation_order = EULER_ORDER_YXZ
+		Mk.torus(self, HUB_R, 0.12, white, Vector3(0, 2.9, 0))
+		var dz := sin(DOOR_HALF) * HUB_R
+		var dx := cos(DOOR_HALF) * HUB_R
+		Mk.box(self, Vector3(0.5, 2.9, 0.3), orange, Vector3(dx, 1.45, dz))
+		Mk.box(self, Vector3(0.5, 2.9, 0.3), orange, Vector3(dx, 1.45, -dz))
+		Mk.box(self, Vector3(0.5, 0.35, dz * 2 + 0.3), orange, Vector3(dx, 2.75, 0))
+		obstacles.append({"t": "ring", "ro": false})
+		add_c(dx, dz, 0.25)
+		add_c(dx, -dz, 0.25)
+		add_c(0, 0, HUB_R + 0.6, true)
+		# bed
+		var bed := Node3D.new()
+		bed.position = Vector3(-4.6, 0.3, 4.2)
+		bed.rotation.y = 0.5
+		add_child(bed)
+		Mk.box(bed, Vector3(2.4, 0.45, 1.4), grey, Vector3(0, 0.25, 0))
+		Mk.box(bed, Vector3(2.3, 0.22, 1.32), Mk.mat(Color("f4f1ea"), 0.9), Vector3(0, 0.58, 0))
+		Mk.box(bed, Vector3(1.5, 0.08, 1.34), Mk.mat(Color("3e6d8e"), 0.9), Vector3(0.4, 0.71, 0))
+		Mk.box(bed, Vector3(0.5, 0.16, 0.9), Mk.mat(Color.WHITE, 0.9), Vector3(-0.85, 0.76, 0))
+		Mk.box(bed, Vector3(0.15, 1.0, 1.4), grey, Vector3(-1.25, 0.6, 0))
+		add_c(-4.6, 4.2, 1.35)
+		# sofa
+		var sofa := Node3D.new()
+		sofa.position = Vector3(-5.6, 0.3, -1.6)
+		sofa.rotation.y = PI / 2.0
+		add_child(sofa)
+		var sm := Mk.mat(Color("c4532a"), 0.9)
+		Mk.box(sofa, Vector3(2.4, 0.45, 0.9), sm, Vector3(0, 0.28, 0))
+		Mk.box(sofa, Vector3(2.4, 0.7, 0.25), sm, Vector3(0, 0.6, -0.35))
+		Mk.box(sofa, Vector3(0.25, 0.6, 0.9), sm, Vector3(-1.2, 0.45, 0))
+		Mk.box(sofa, Vector3(0.25, 0.6, 0.9), sm, Vector3(1.2, 0.45, 0))
+		add_c(-5.6, -1.6, 1.25)
+		Mk.cyl(self, 1.7, 1.7, 0.03, Mk.mat(Color("6b4a8a"), 1.0), Vector3(-3.4, 0.32, 0.8), 32)
+		Mk.cyl(self, 0.55, 0.55, 0.08, Mk.mat(Color("8a5a3a"), 0.8), Vector3(-3.6, 0.75, -1.4), 24)
+		Mk.cyl(self, 0.07, 0.07, 0.4, dark, Vector3(-3.6, 0.52, -1.4), 8)
+		add_c(-3.6, -1.4, 0.6)
+		Mk.cyl(self, 0.04, 0.04, 1.6, dark, Vector3(-6.6, 1.1, 2), 8)
+		Mk.sphere(self, 0.22, Mk.unshaded(Color("fff0c0")), Vector3(-6.6, 1.95, 2), 12)
+		var lamp := OmniLight3D.new()
+		lamp.position = Vector3(-6.6, 2.0, 2)
+		lamp.light_color = Color("fff0c0")
+		lamp.omni_range = 7.0
+		lamp.light_energy = 0.8
+		add_child(lamp)
+		add_label("Living room\nBed & sleep quarters", Vector3(-4.6, 3.1, 3.2), Color("9ac8ff"))
+		# food
+		var food := Node3D.new()
+		food.position = Vector3(1.5, 0.3, -6.4)
+		add_child(food)
+		Mk.box(food, Vector3(4.2, 2.2, 0.9), grey, Vector3(0, 1.1, 0))
+		var fc := ["e0632c", "3e9a45", "f2c14e", "2f6fb5", "c23b2a", "ece7e0"]
+		for r in 3:
+			for c in 6:
+				Mk.box(food, Vector3(0.55, 0.5, 0.55), Mk.mat(Color(fc[(r * 2 + c) % 6]), 0.7), Vector3(-1.6 + c * 0.64, 0.35 + r * 0.68, 0.25))
+		add_s(-0.6, -6.4, 3.6, -6.4, 0.6)
+		add_label("Food supply\nFreeze-dried meals", Vector3(1.5, 3.3, -6.4), Color("f2c14e"))
+		# console
+		var cons := Node3D.new()
+		cons.position = Vector3(4.5, 0.3, 3.8)
+		cons.rotation.y = -2.3
+		add_child(cons)
+		Mk.box(cons, Vector3(2.6, 0.9, 0.8), dark, Vector3(0, 0.45, 0))
+		Mk.box(cons, Vector3(2.4, 0.05, 0.6), Mk.unshaded(Color("5fd3c4")), Vector3(0, 0.93, 0.05))
+		Mk.box(cons, Vector3(2.6, 1.0, 0.08), dark, Vector3(0, 1.6, -0.35))
+		Mk.box(cons, Vector3(2.3, 0.8, 0.02), Mk.emissive(Color("1a8f84"), 1.2), Vector3(0, 1.6, -0.3))
+		add_c(4.5, 3.8, 1.3)
+		add_label("Mission Control", Vector3(4.5, 3.0, 3.8), Color("5fd3c4"))
+		Mk.cyl(self, 0.7, 0.7, 0.06, white, Vector3(3.2, 1.1, -2.2), 24)
+		Mk.cyl(self, 0.08, 0.12, 0.8, grey, Vector3(3.2, 0.7, -2.2), 8)
+		add_c(3.2, -2.2, 0.75)
+		var title := Mk.label(self, "Base Ares-1\nGale Crater, Mars", Vector3(0, 13.5, 0), 80, Color("ff9a6b"), 0.02)
+		title.visibility_range_end = 160.0
+
+	func _build_outside() -> void:
+		var white := Mk.mat(Color("ece7e0"), 0.55, 0.1)
+		var grey := Mk.mat(Color("9aa0a8"), 0.5, 0.35)
+		for pz in [[-11.2, -2.4], [-11.8, -0.8], [-11.8, 0.8], [-11.2, 2.4]]:
+			var g := Node3D.new()
+			g.position = Vector3(pz[0], 0, pz[1])
+			add_child(g)
+			Mk.cyl(g, 0.55, 0.55, 2.6, white, Vector3(0, 1.5, 0), 20)
+			Mk.sphere(g, 0.55, white, Vector3(0, 2.8, 0), 20, true)
+			Mk.cyl(g, 0.56, 0.56, 0.35, Mk.mat(Color("2f6fb5"), 0.5), Vector3(0, 2.0, 0), 20)
+			Mk.box(g, Vector3(1.3, 0.2, 1.3), grey, Vector3(0, 0.1, 0))
+			add_c(pz[0], pz[1], 0.65)
+		add_label("Oxygen tanks\nO₂ refill station", Vector3(-11.6, 4.6, 0), Color("7fb8ff"))
+		var solar := Mk.mat(Color("1b2b5a"), 0.25, 0.6)
+		for i in 3:
+			for j in 4:
+				var x := -40.0 - i * 5.0
+				var z := -9.0 + j * 6.0
+				Mk.cyl(self, 0.08, 0.08, 1.4, grey, Vector3(x, 0.7, z), 6)
+				var p := Mk.box(self, Vector3(3.6, 0.08, 2.2), solar, Vector3(x, 1.45, z))
+				p.rotation.z = -0.45
+				add_c(x, z, 1.4)
+		add_label("Solar array", Vector3(-45, 5, 0), Color("9ab0ff"))
+		Mk.cyl(self, 0.3, 0.5, 4.0, grey, Vector3(2, 2, -44), 10)
+		var bowl := Mk.sphere(self, 2.6, Mk.mat(Color("f0ece6"), 0.5, 0.2), Vector3(2, 4.8, -44), 24, true)
+		bowl.rotation.x = PI + 0.7
+		bowl.scale = Vector3(1, 0.45, 1)
+		add_c(2, -44, 0.8)
+		add_label("Earth comms dish", Vector3(2, 9.5, -44), Color("cfd6e0"))
+		Mk.cyl(self, 7.0, 7.3, 0.16, Mk.mat(Color("5a5c62"), 0.9), Vector3(0, 0.08, 46), 40)
+		var h := Mk.label(self, "H", Vector3(0, 0.2, 46), 300, Color("f2c14e"), 0.025, false)
+		h.rotation.x = -PI / 2.0
+		add_label("Landing pad", Vector3(0, 4, 46), Color("f2c14e"))
+
+	func _build_greenhouses() -> void:
+		var white := Mk.mat(Color("ece7e0"), 0.55, 0.1)
+		var grey := Mk.mat(Color("9aa0a8"), 0.5, 0.35)
+		var leaf_m := MultiMesh.new()
+		leaf_m.transform_format = MultiMesh.TRANSFORM_3D
+		var fruit_m := MultiMesh.new()
+		fruit_m.transform_format = MultiMesh.TRANSFORM_3D
+		var leaves: Array = []
+		var fruits: Array = []
+		var rng := RandomNumberGenerator.new()
+		rng.seed = 11
+		var L := 12.0
+		var R := 4.0
+		var D0 := HUB_R - 0.3
+		var DC := 24.0
+		var names := ["Potatoes", "Lettuce & herbs", "Tomatoes", "Soybeans"]
+		var idx := 0
+		for k in [1, 3, 5, 7]:
+			var a := float(k) * PI / 4.0
+			var dir := Vector2(cos(a), sin(a))
+			var g := Node3D.new()
+			g.position = Vector3(dir.x * DC, 0, dir.y * DC)
+			g.rotation.y = PI / 2.0 - a
+			add_child(g)
+			Mk.mi(g, Mk.half_cyl_mesh(R, L), Mk.glass())
+			for s in 7:
+				var t := Mk.torus(g, R, 0.07, white, Vector3(0, 0, -L / 2.0 + s * L / 6.0))
+				t.rotation.x = PI / 2.0
+			Mk.box(g, Vector3(R * 2 + 0.3, 0.3, L + 0.3), Mk.mat(Color("7b7f86"), 0.8), Vector3(0, 0.15, 0))
+			var glow := Mk.unshaded(Color("ff70d0"))
+			for px in [0.0, 1.6, -1.6]:
+				Mk.box(g, Vector3(0.08, 0.08, L - 0.6), glow, Vector3(px, 3.2 if px == 0.0 else 2.6, 0))
+			for px in [-2.1, 0.0, 2.1]:
+				Mk.box(g, Vector3(1.1, 0.45, L - 1.4), Mk.mat(Color("4a2c1c"), 1.0), Vector3(px, 0.52, 0))
+				for j in 9:
+					var pz := -L / 2.0 + 1.3 + j * 1.17
+					var sc := 0.35 + rng.randf() * 0.25
+					var local := Transform3D(Basis.from_euler(Vector3(0, rng.randf() * 3.0, 0)).scaled(Vector3(sc, sc * 1.6, sc)), Vector3(px, 0.75 + sc * 0.9, pz))
+					leaves.append(g.transform * local)
+					if rng.randf() < 0.55:
+						fruits.append(g.transform * Transform3D(Basis().scaled(Vector3.ONE * 0.12), Vector3(px + rng.randf_range(-0.2, 0.2), 0.9 + sc * 1.2, pz + rng.randf_range(-0.2, 0.2))))
+			add_label("Greenhouse %d\n%s" % [idx + 1, names[idx]], Vector3(dir.x * DC, 6, dir.y * DC), Color("7ddc84"))
+			var tg := Node3D.new()
+			tg.rotation.y = PI / 2.0 - a
+			add_child(tg)
+			var length := DC - L / 2.0 - D0
+			var tun := Mk.cyl(tg, 1.3, 1.3, length, white, Vector3(0, 1.3, D0 + length / 2.0), 20)
+			tun.rotation.x = PI / 2.0
+			for r in 4:
+				var rib := Mk.torus(tg, 1.34, 0.08, grey, Vector3(0, 1.3, D0 + 0.5 + r * (length - 1.0) / 3.0))
+				rib.rotation.x = PI / 2.0
+			add_s(dir.x * (DC - L / 2.0), dir.y * (DC - L / 2.0), dir.x * (DC + L / 2.0), dir.y * (DC + L / 2.0), R)
+			add_s(dir.x * D0, dir.y * D0, dir.x * (DC - L / 2.0), dir.y * (DC - L / 2.0), 1.3)
+			idx += 1
+		var leaf := SphereMesh.new()
+		leaf.radius = 1.0
+		leaf.height = 2.0
+		leaf.radial_segments = 6
+		leaf.rings = 3
+		leaf_m.mesh = leaf
+		leaf_m.instance_count = leaves.size()
+		for i in leaves.size():
+			leaf_m.set_instance_transform(i, leaves[i])
+		var fruit := SphereMesh.new()
+		fruit.radius = 1.0
+		fruit.height = 2.0
+		fruit.radial_segments = 8
+		fruit.rings = 4
+		fruit_m.mesh = fruit
+		fruit_m.instance_count = fruits.size()
+		for i in fruits.size():
+			fruit_m.set_instance_transform(i, fruits[i])
+		var li := MultiMeshInstance3D.new()
+		li.multimesh = leaf_m
+		li.material_override = Mk.mat(Color("3faa4c"), 0.8)
+		add_child(li)
+		var fi := MultiMeshInstance3D.new()
+		fi.multimesh = fruit_m
+		fi.material_override = Mk.mat(Color("e0402a"), 0.6)
+		add_child(fi)
+
+	func _build_garage() -> void:
+		var white := Mk.mat(Color("ece7e0"), 0.55, 0.1)
+		var grey := Mk.mat(Color("9aa0a8"), 0.5, 0.35)
+		var dark := Mk.mat(Color("2c3038"), 0.6, 0.3)
+		var g := Node3D.new()
+		g.position = Vector3(44, 0, 0)
+		add_child(g)
+		Mk.box(g, Vector3(16, 0.2, 14), Mk.mat(Color("7b7f86"), 0.8), Vector3(0, 0.1, 0))
+		Mk.box(g, Vector3(0.4, 6, 14), white, Vector3(8, 3, 0))
+		Mk.box(g, Vector3(16, 6, 0.4), white, Vector3(0, 3, 7))
+		Mk.box(g, Vector3(16, 6, 0.4), white, Vector3(0, 3, -7))
+		Mk.box(g, Vector3(16.6, 0.4, 14.6), grey, Vector3(0, 6.1, 0))
+		for k in 8:
+			Mk.box(g, Vector3(0.42, 0.6, 1.8), dark if k % 2 == 1 else Mk.mat(Color("f2c14e"), 0.6), Vector3(-8, 5.6, -6.3 + k * 1.8))
+		Mk.box(g, Vector3(1.2, 2.4, 3.5), grey, Vector3(6.8, 1.3, -4.5))
+		Mk.box(g, Vector3(0.8, 1.6, 0.8), dark, Vector3(6.6, 1, 4.5))
+		var cols := ["e0632c", "2f6fb5", "3e9a45", "f2c14e"]
+		for k in 4:
+			Mk.box(g, Vector3(1.1, 0.4, 0.6), Mk.mat(Color(cols[k]), 0.7), Vector3(6.8, 0.9 + k * 0.55, -4.5 + ((k % 2) - 0.5) * 0.9))
+		var lamp := OmniLight3D.new()
+		lamp.position = Vector3(0, 5.4, 0)
+		lamp.omni_range = 22.0
+		lamp.light_energy = 1.0
+		g.add_child(lamp)
+		add_s(52, -7, 52, 7, 0.3)
+		add_s(36, 7, 52, 7, 0.3)
+		add_s(36, -7, 52, -7, 0.3)
+		add_label("Rover garage", Vector3(44, 8.4, 0), Color("ff9a6b"), 80)
+		add_label("Workbench", Vector3(50.5, 3.4, -4.5), Color("cfd6e0"), 48)
+
+	# ------------------------------------------------------------------ collectibles
+	func spawn_collectibles() -> void:
+		for o in gems + prizes:
+			o["node"].queue_free()
+		gems.clear()
+		prizes.clear()
+		var rng := RandomNumberGenerator.new()
+		rng.seed = 1000 + int(main.save["seed"]) * 17
+		var gem_cols := [Color("ff3b5c"), Color("34e08a"), Color("3aa0ff"), Color("b36bff"), Color("ffd23a")]
+		var gem_mesh := Mk.octa_mesh(0.42)
+		for i in 30:
+			var x := 0.0
+			var z := 0.0
+			for t in 50:
+				var a := rng.randf() * TAU
+				var d := 14.0 + pow(rng.randf(), 0.8) * 130.0
+				x = cos(a) * d
+				z = sin(a) * d
+				if free_spot(x, z, 1.2):
+					break
+			var c: Color = gem_cols[i % 5]
+			var g := Node3D.new()
+			g.position = Vector3(x, terrain_h(x, z) + 1.0, z)
+			add_child(g)
+			var m := Mk.mi(g, gem_mesh, Mk.emissive(c, 0.8))
+			var ol := OmniLight3D.new()
+			ol.light_color = c
+			ol.omni_range = 3.0
+			ol.light_energy = 0.6
+			g.add_child(ol)
+			gems.append({"node": g, "base": g.position.y, "taken": false, "col": c, "ph": rng.randf() * TAU})
+		for i in 12:
+			var x := 0.0
+			var z := 0.0
+			for t in 50:
+				var a := rng.randf() * TAU
+				var d := 70.0 + rng.randf() * 220.0
+				x = cos(a) * d
+				z = sin(a) * d
+				if free_spot(x, z, 2.0):
+					break
+			var g := Node3D.new()
+			g.position = Vector3(x, terrain_h(x, z), z)
+			add_child(g)
+			var b := Mk.box(g, Vector3(1.4, 1.4, 1.4), Mk.emissive(Color("e0a52a"), 0.5), Vector3(0, 1.2, 0))
+			Mk.box(b, Vector3(1.45, 0.25, 1.45), Mk.mat(Color("7a4a10"), 0.6))
+			Mk.cyl(g, 0.35, 0.35, 40.0, Mk.unshaded(Color("ffd24a"), 0.22, true), Vector3(0, 20, 0), 10)
+			prizes.append({"node": g, "box": b, "taken": false, "ph": rng.randf() * TAU})
+		main.ui.set_totals(gems.size(), prizes.size())
+
+	func respawn_treasure() -> void:
+		main.save["seed"] = int(main.save["seed"]) + 1
+		main.persist()
+		spawn_collectibles()
+		gems_got = 0
+		prizes_got = 0
+		main.ui.update_hud()
+		main.toast("New gems and prize crates have landed around the base")
+
+	# ------------------------------------------------------------------ main loop
+	func _get_input() -> Vector2:
+		var v: Vector2 = main.ui.joy_vector
+		v.y += Input.get_action_strength("move_forward") - Input.get_action_strength("move_back")
+		v.x += Input.get_action_strength("move_right") - Input.get_action_strength("move_left")
+		return Vector2(clamp(v.x, -1.0, 1.0), clamp(v.y, -1.0, 1.0))
+
+	func _process(dt: float) -> void:
+		dt = min(dt, 0.05)
+		var t := Time.get_ticks_msec() / 1000.0
+		for g in gems:
+			if not g["taken"]:
+				g["node"].rotation.y += dt * 1.6
+				g["node"].position.y = g["base"] + sin(t * 2.0 + g["ph"]) * 0.25
+		for p in prizes:
+			if not p["taken"]:
+				p["box"].rotation.y += dt * 0.8
+				p["box"].position.y = 1.2 + sin(t * 1.6 + p["ph"]) * 0.15
+		_update_anims(dt)
+		if customizing:
+			cam_yaw += dt * 0.3
+			avatar.position = p_pos
+			avatar.rotation.y = p_heading
+			avatar.pose(dt, false, true, walk_t, false)
+			var ty := p_pos.y + 1.0
+			cam.position = Vector3(p_pos.x + sin(cam_yaw) * 5.4 * cos(0.15), ty + sin(0.15) * 5.4, p_pos.z + cos(cam_yaw) * 5.4 * cos(0.15))
+			cam.look_at(Vector3(p_pos.x, ty, p_pos.z), Vector3.UP)
+			return
+		var paused: bool = main.ui.modal_open()
+		var inp := Vector2.ZERO if paused else _get_input()
+		if paused:
+			jump_queued = false
+		elif Input.is_action_just_pressed("jump"):
+			jump_queued = true
+		if not paused and Input.is_action_just_pressed("interact"):
+			do_action()
+		if not paused and Input.is_action_just_pressed("missions"):
+			main.ui.open_mc("")
+		var moving := false
+		if not in_rover:
+			var fx := -sin(cam_yaw)
+			var fz := -cos(cam_yaw)
+			var mx := fx * inp.y - fz * inp.x
+			var mz := fz * inp.y + fx * inp.x
+			var mag := sqrt(mx * mx + mz * mz)
+			if mag > 0.08:
+				moving = true
+				var sp := (7.5 if Input.is_action_pressed("sprint") else 4.4) * minf(1.0, mag) * (0.55 if energy < 15.0 else 1.0)
+				mx /= mag
+				mz /= mag
+				p_pos.x += mx * sp * dt
+				p_pos.z += mz * sp * dt
+				p_heading = lerp_angle(p_heading, atan2(mx, mz), 1.0 - exp(-dt * 12.0))
+				walk_t += dt * sp * 2.1
+				daily_progress("walk", sp * dt)
+			p_pos = resolve(p_pos, 0.45, false)[0]
+			var gy := ground_at(p_pos.x, p_pos.z)
+			if jump_queued and p_ground and not busy:
+				p_vy = 4.4
+				p_ground = false
+				daily_progress("jump", 1)
+				energy = max(0.0, energy - 0.6)
+			p_vy -= GRAVITY * dt
+			p_pos.y += p_vy * dt
+			if p_pos.y <= gy:
+				p_pos.y = gy
+				p_vy = 0.0
+				p_ground = true
+			elif p_ground and p_pos.y - gy < 0.45:
+				p_pos.y = gy
+				p_vy = 0.0
+			elif p_pos.y - gy >= 0.45:
+				p_ground = false
+			avatar.position = p_pos
+			avatar.rotation.y = p_heading
+			for s in rover.steers:
+				s.rotation.y = 0.0
+		else:
+			var thr := inp.y
+			rover.speed += thr * 13.0 * dt
+			rover.speed *= exp(-dt * (0.35 if abs(thr) > 0.05 else 1.4))
+			rover.speed = clamp(rover.speed, -6.0, 18.0)
+			rover.heading -= inp.x * 1.7 * dt * clamp(rover.speed / 5.0, -1.0, 1.0)
+			r_pos.x += sin(rover.heading) * rover.speed * dt
+			r_pos.z += cos(rover.heading) * rover.speed * dt
+			daily_progress("drive", abs(rover.speed) * dt)
+			var res := resolve(r_pos, 2.1, true)
+			r_pos = res[0]
+			if res[1]:
+				rover.speed *= 0.6
+			for s in rover.steers:
+				s.rotation.y = -inp.x * 0.42
+			moving = abs(rover.speed) > 0.5
+		jump_queued = false
+		_place_rover(dt)
+		avatar.pose(dt, moving, p_ground, walk_t, in_rover)
+		if not paused:
+			var in_hub := not in_rover and Vector2(p_pos.x, p_pos.z).length() < HUB_R
+			if in_rover:
+				o2 = min(100.0, o2 + dt * 3.0)
+			elif in_hub:
+				o2 = min(100.0, o2 + dt * 25.0)
+			else:
+				o2 = max(0.0, o2 - dt * 0.5)
+			if o2 > 40.0:
+				o2_warned = false
+			if o2 < 25.0 and not o2_warned:
+				o2_warned = true
+				main.toast("Oxygen low! Head back to the base, the O₂ tanks, or the rover.")
+			if o2 <= 0.0 and not o2_resetting:
+				o2_resetting = true
+				main.fade(_o2_reset_done)
+			_update_energy(dt, moving)
+			update_missions(dt)
+			_daily_location_checks()
+			_check_collect(t)
+		else:
+			update_missions(0.0)
+		var a = compute_action()
+		var aid: String = a["id"] if a else ""
+		if aid != current_action:
+			current_action = aid
+			main.ui.set_action(a["label"] if a else "")
+		if t - tracker_t > 0.2:
+			tracker_t = t
+			main.ui.update_tracker()
+			main.ui.update_bars(o2, energy)
+			main.ui.minimap.queue_redraw()
+		if daily_dirty and t - daily_persist_t > 3.0:
+			daily_persist_t = t
+			daily_dirty = false
+			main.persist()
+		_update_camera(dt, t)
+
+	func _place_rover(dt: float) -> void:
+		var h: float = rover.heading
+		var c := cos(h)
+		var s := sin(h)
+		var hf := ground_at(r_pos.x + s * 1.6, r_pos.z + c * 1.6)
+		var hb := ground_at(r_pos.x - s * 1.6, r_pos.z - c * 1.6)
+		var hl := ground_at(r_pos.x + c * 1.2, r_pos.z - s * 1.2)
+		var hr := ground_at(r_pos.x - c * 1.2, r_pos.z + s * 1.2)
+		r_pos.y = max(ground_at(r_pos.x, r_pos.z), (hf + hb + hl + hr) / 4.0)
+		var k := 1.0 - exp(-dt * 8.0)
+		rover.pitch = lerp(rover.pitch, atan2(hb - hf, 3.2), k)
+		rover.roll = lerp(rover.roll, atan2(hl - hr, 2.4), k)
+		rover.position = r_pos
+		rover.rotation_order = EULER_ORDER_YXZ
+		rover.rotation = Vector3(rover.pitch, h, rover.roll)
+		for w in rover.wheels:
+			w.rotation.x += rover.speed * dt / 0.48
+
+	func _update_camera(dt: float, t: float) -> void:
+		var tgt: Vector3 = r_pos if in_rover else p_pos
+		if in_rover and t - last_drag > 1.2:
+			cam_yaw = lerp_angle(cam_yaw, rover.heading + PI, 1.0 - exp(-dt * 2.2))
+		cam_dist = lerp(cam_dist, cam_dist_t, 1.0 - exp(-dt * 5.0))
+		var ty := tgt.y + (2.2 if in_rover else 1.5)
+		var cp := Vector3(tgt.x + sin(cam_yaw) * cos(cam_pitch) * cam_dist, ty + sin(cam_pitch) * cam_dist, tgt.z + cos(cam_yaw) * cos(cam_pitch) * cam_dist)
+		cp.y = max(cp.y, terrain_h(cp.x, cp.z) + 0.7)
+		if tgt.x > 36.0 and tgt.x < 52.0 and abs(tgt.z) < 7.0:
+			cp.x = clampf(cp.x, 30.0, 51.3)
+			cp.z = clampf(cp.z, -6.5, 6.5)
+			cp.y = minf(cp.y, 5.4)
+		cam.position = cp
+		cam.look_at(Vector3(tgt.x, ty, tgt.z), Vector3.UP)
+		for l in m_labels:
+			if is_instance_valid(l):
+				l.visible = not busy and l.global_position.distance_to(cp) > 7.5
+
+	func _unhandled_input(ev: InputEvent) -> void:
+		if customizing or main.ui.modal_open():
+			return
+		if ev is InputEventScreenDrag:
+			if ev.index == main.ui.joy_index:
+				return
+			cam_yaw -= ev.relative.x * 0.007
+			cam_pitch = clamp(cam_pitch + ev.relative.y * 0.005, 0.02, 1.25)
+			last_drag = Time.get_ticks_msec() / 1000.0
+		elif ev is InputEventMouseMotion and not DisplayServer.is_touchscreen_available():
+			if ev.button_mask & MOUSE_BUTTON_MASK_LEFT:
+				cam_yaw -= ev.relative.x * 0.007
+				cam_pitch = clamp(cam_pitch + ev.relative.y * 0.005, 0.02, 1.25)
+				last_drag = Time.get_ticks_msec() / 1000.0
+		elif ev is InputEventMouseButton and ev.pressed:
+			if ev.button_index == MOUSE_BUTTON_WHEEL_UP:
+				cam_dist_t = clamp(cam_dist_t * 0.9, 3.0, 24.0)
+			elif ev.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+				cam_dist_t = clamp(cam_dist_t * 1.1, 3.0, 24.0)
+
+	func _check_collect(t: float) -> void:
+		var cp: Vector3 = r_pos if in_rover else p_pos
+		for g in gems:
+			if g["taken"]:
+				continue
+			var gp: Vector3 = g["node"].position
+			var r := 3.0 if in_rover else 1.5
+			if Vector2(gp.x - cp.x, gp.z - cp.z).length() < r and abs(gp.y - (cp.y + 1.0)) < 2.6:
+				g["taken"] = true
+				g["node"].visible = false
+				Mk.burst(self, gp, g["col"])
+				gems_got += 1
+				main.add_gems(1)
+				daily_progress("gems", 1)
+				main.toast("Gem found! +1 gem")
+				_check_win()
+		for p in prizes:
+			if p["taken"]:
+				continue
+			var pp: Vector3 = p["node"].position
+			var d := Vector2(pp.x - cp.x, pp.z - cp.z).length()
+			if in_rover and d < 3.8:
+				p["taken"] = true
+				p["node"].visible = false
+				Mk.burst(self, pp + Vector3(0, 1.2, 0), Color("ffd24a"))
+				prizes_got += 1
+				main.add_gems(5)
+				main.toast("Prize crate loaded into ARES! +5 gems")
+				_check_win()
+			elif not in_rover and d < 2.8 and t > prize_nag:
+				prize_nag = t + 6.0
+				main.toast("This crate is too heavy to carry. Bring the rover here to haul it!")
+
+	func _check_win() -> void:
+		main.ui.update_hud()
+		if gems_got >= gems.size() and prizes_got >= prizes.size():
+			main.ui.show_win()
+
+	# ------------------------------------------------------------------ player helpers
+	func place_player_at_base() -> void:
+		if in_rover:
+			exit_rover(true)
+		p_pos = Vector3(18, ground_at(18, -1), -1)
+		p_vy = 0.0
+		p_ground = true
+		p_heading = PI / 2.0
+		cam_yaw = -PI / 2.0 + 0.6
+		cam_pitch = 0.32
+		cam_dist = 7.0
+		cam_dist_t = 7.0
+
+	func enter_rover() -> void:
+		in_rover = true
+		avatar.reparent(rover, false)
+		avatar.position = Vector3(0, 0.45, 0.15)
+		avatar.rotation = Vector3.ZERO
+		cam_dist_t = 12.0
+		cam_pitch = 0.3
+		main.ui.update_hud()
+		if not rover_hinted:
+			rover_hinted = true
+			main.toast("You’re driving ARES. Follow the golden beams to the prize crates!")
+
+	func exit_rover(silent := false) -> void:
+		in_rover = false
+		avatar.reparent(self, false)
+		var h: float = rover.heading
+		var p := r_pos + Vector3(cos(h), 0, -sin(h)) * 2.9
+		p = resolve(p, 0.45, false)[0]
+		p.y = ground_at(p.x, p.z)
+		p_pos = p
+		p_vy = 0.0
+		p_ground = true
+		p_heading = h
+		rover.speed = 0.0
+		cam_dist_t = 7.0
+		if not silent:
+			main.ui.update_hud()
+
+	func compute_action() -> Variant:
+		var st = cur_step()
+		if st and st["type"] == "act" and not busy:
+			var L := loc_of(st)
+			var P: Vector3 = r_pos if in_rover else p_pos
+			var need: bool = st.get("need_rover", false)
+			if Vector2(P.x, P.z).distance_to(L["p"]) < L["r"] + (1.5 if in_rover else 0.0) and (not need or in_rover):
+				return {"id": "mact", "label": st["label"]}
+		if in_rover:
+			return {"id": "exit", "label": "Exit rover"}
+		var p := Vector2(p_pos.x, p_pos.z)
+		if p.distance_to(Vector2(r_pos.x, r_pos.z)) < 4.2:
+			return {"id": "enter", "label": "Drive the rover"}
+		if p.distance_to(Vector2(4.5, 3.8)) < 2.9:
+			return {"id": "mc", "label": "Open Mission Control"}
+		if p.distance_to(Vector2(-4.6, 4.2)) < 2.7:
+			return {"id": "sleep", "label": "Sleep (end the sol)"}
+		if p.distance_to(Vector2(-5.6, -1.6)) < 2.5:
+			return {"id": "rest", "label": "Rest on the sofa"}
+		if p.distance_to(Vector2(1.5, -6.4)) < 2.9:
+			return {"id": "eat", "label": "Eat a meal"}
+		if p.distance_to(Vector2(-11.4, 0)) < 3.4:
+			return {"id": "o2", "label": "Refill O₂"}
+		return null
+
+	func do_action() -> void:
+		if busy or main.ui.modal_open():
+			return
+		var a = compute_action()
+		if a == null:
+			return
+		match a["id"]:
+			"enter":
+				enter_rover()
+			"exit":
+				exit_rover()
+			"mact":
+				start_mission_anim(cur_step())
+			"mc":
+				daily_progress("comms", 1)
+				main.ui.open_mc("")
+			"sleep":
+				do_sleep()
+			"rest":
+				do_rest()
+			"eat":
+				do_eat()
+			"o2":
+				o2 = 100.0
+				o2_warned = false
+				main.toast("Oxygen refilled to 100%")
+
+	func _update_energy(dt: float, moving: bool) -> void:
+		var drain := 0.04 if in_rover else (0.22 if moving else 0.05)
+		energy = max(0.0, energy - drain * dt)
+		if energy < 15.0 and not en_warned:
+			en_warned = true
+			main.toast("You’re exhausted and moving slowly. Eat a meal or rest on the sofa.")
+		if energy > 30.0:
+			en_warned = false
+
+	# ------------------------------------------------------------------ daily log
+	func new_daily(sol: int) -> Dictionary:
+		var ids: Array = D.CHALLENGES.keys()
+		var rng := RandomNumberGenerator.new()
+		rng.seed = sol * 977 + 3
+		var pick: Array = []
+		while pick.size() < 2:
+			var id: String = ids[rng.randi() % ids.size()]
+			if not pick.has(id):
+				pick.append(id)
+		var ch: Array = []
+		for id in pick:
+			ch.append({"id": id, "prog": 0.0, "done": false})
+		return {"sol": sol, "meals": 0, "rested": false, "ch": ch, "gh": [], "earned": 0}
+
+	func daily_progress(id: String, amt: float) -> void:
+		var d: Dictionary = main.save["daily"]
+		for c in d["ch"]:
+			if c["id"] == id and not c["done"]:
+				var C: Dictionary = D.CHALLENGES[id]
+				c["prog"] = min(float(C["target"]), float(c["prog"]) + amt)
+				if c["prog"] >= C["target"]:
+					c["done"] = true
+					main.add_gems(int(C["reward"]))
+					main.toast("Daily challenge done: %s. +%d gems" % [C["text"], C["reward"]])
+				else:
+					daily_dirty = true
+
+	func _daily_location_checks() -> void:
+		if in_rover:
+			return
+		var d: Dictionary = main.save["daily"]
+		var p := Vector2(p_pos.x, p_pos.z)
+		for i in gh_centers.size():
+			if not d["gh"].has(i) and p.distance_to(gh_centers[i]) < 8.0:
+				d["gh"].append(i)
+				daily_progress("greenhouse", 1)
+				main.toast("Greenhouse %d checked" % (i + 1))
+		if p.distance_to(Vector2(-11.4, 0)) < 3.6:
+			daily_progress("o2check", 1)
+
+	func do_eat() -> void:
+		var d: Dictionary = main.save["daily"]
+		d["meals"] = int(d["meals"]) + 1
+		energy = min(100.0, energy + 30.0)
+		var meal: String = D.MEALS[randi() % D.MEALS.size()]
+		if d["meals"] == 2:
+			main.add_gems(D.DAILY_REWARD["meals"])
+			main.toast("You ate %s. Daily log: 2 meals done. +%d gems" % [meal, D.DAILY_REWARD["meals"]])
+		else:
+			main.toast("You ate %s. Energy +30" % meal)
+		main.persist()
+
+	func do_rest() -> void:
+		busy = true
+		main.fade(_rest_done)
+
+	func _rest_done() -> void:
+		busy = false
+		energy = min(100.0, energy + 40.0)
+		var d: Dictionary = main.save["daily"]
+		if not d["rested"]:
+			d["rested"] = true
+			main.add_gems(D.DAILY_REWARD["rest"])
+			main.toast("You put your feet up for an hour. Daily log: rest done. +%d gems" % D.DAILY_REWARD["rest"])
+		else:
+			main.toast("A nice break. Energy +40")
+		main.persist()
+
+	func do_sleep() -> void:
+		busy = true
+		main.fade(_sleep_done)
+
+	func _sleep_done() -> void:
+		busy = false
+		var d: Dictionary = main.save["daily"]
+		main.add_gems(D.DAILY_REWARD["sleep"])
+		var all_done: bool = int(d["meals"]) >= 2 and d["rested"]
+		for c in d["ch"]:
+			if not c["done"]:
+				all_done = false
+		if all_done:
+			main.add_gems(D.DAILY_REWARD["bonus"])
+		var prev: Dictionary = d.duplicate(true)
+		main.save["sol"] = int(main.save["sol"]) + 1
+		main.save["daily"] = new_daily(main.save["sol"])
+		o2 = 100.0
+		energy = 100.0
+		main.persist()
+		main.ui.update_hud()
+		main.ui.show_sol_summary(prev, all_done)
+
+	func _o2_reset_done() -> void:
+		place_player_at_base()
+		o2 = 100.0
+		o2_resetting = false
+		main.toast("Your oxygen ran out, so mission control brought you back inside the base.")
+
+	func apply_fx(fx: Dictionary) -> void:
+		if fx.has("o2"):
+			o2 = clamp(o2 + fx["o2"], 5.0, 100.0)
+		if fx.has("energy"):
+			energy = clamp(energy + fx["energy"], 5.0, 100.0)
+		if fx.has("gems"):
+			main.add_gems(int(fx["gems"]))
+
+	# ------------------------------------------------------------------ missions
+	func _resolve_missions() -> void:
+		for m in D.MISSIONS:
+			var steps: Array = []
+			for s in m["steps"]:
+				var r: Dictionary = s.duplicate(true)
+				if s.has("points"):
+					var pts: Array = []
+					for pr in s["points"]:
+						pts.append(spot(pr[0], pr[1]))
+					r["pts"] = pts
+				if s.has("cluster"):
+					var c: Array = s["cluster"]
+					r["ipos"] = cluster(c[0], c[1], s["items"].size(), c[2])
+				if s.has("to") and typeof(s["to"]) == TYPE_ARRAY:
+					r["to_pos"] = spot(s["to"][0], s["to"][1])
+				steps.append(r)
+			mres[m["id"]] = steps
+
+	func mission_by_id(id: String) -> Variant:
+		for m in D.MISSIONS:
+			if m["id"] == id:
+				return m
+		return null
+
+	func active_mission() -> Variant:
+		var a = main.save.get("active")
+		if a == null:
+			return null
+		return mission_by_id(a["id"])
+
+	func cur_step() -> Variant:
+		var a = main.save.get("active")
+		if a == null or not mres.has(a["id"]):
+			return null
+		var steps: Array = mres[a["id"]]
+		var i := int(a["step"])
+		return steps[i] if i < steps.size() else null
+
+	func loc_of(st: Dictionary) -> Dictionary:
+		var t = st["to"]
+		if typeof(t) == TYPE_STRING:
+			var L: Dictionary = D.LOCATIONS[t]
+			return {"p": Vector2(L["p"][0], L["p"][1]), "r": L["r"], "label": L["label"]}
+		return {"p": st["to_pos"], "r": 4.5, "label": st.get("loc_label", st.get("label", "Target"))}
+
+	func step_text(st) -> String:
+		if st == null:
+			return ""
+		var a = main.save["active"]
+		var d: int = a["done"].size() if a else 0
+		var rv := " (use the rover)" if st.get("need_rover", false) and not in_rover else ""
+		match st["type"]:
+			"visit":
+				return "%s %d/%d%s" % [st["text"], d, st["pts"].size(), rv]
+			"collect":
+				return "%s %d/%d" % [st["text"], d, st["items"].size()]
+			"assemble":
+				return st["title"]
+		return st["text"] + rv
+
+	func _marker(p: Vector2, r: float, text: String) -> void:
+		var g := Node3D.new()
+		g.position = Vector3(p.x, ground_at(p.x, p.y), p.y)
+		m_group.add_child(g)
+		var teal := Color("5fd3c4")
+		Mk.torus(g, r, 0.12, Mk.unshaded(teal, 0.9), Vector3(0, 0.12, 0))
+		Mk.cyl(g, 0.3, 0.3, 30.0, Mk.unshaded(teal, 0.3, true), Vector3(0, 15, 0), 10)
+		if text != "":
+			m_labels.append(Mk.label(g, text, Vector3(0, 3.6, 0), 64, teal, 0.012))
+
+	func _item(it: Array, p: Vector2) -> void:
+		var g := Node3D.new()
+		g.position = Vector3(p.x, ground_at(p.x, p.y), p.y)
+		m_group.add_child(g)
+		var c := Color(it[2])
+		var m := Mk.emissive(c, 0.3)
+		var holder := Node3D.new()
+		holder.position.y = 0.7
+		g.add_child(holder)
+		match it[1]:
+			"can":
+				Mk.cyl(holder, 0.22, 0.22, 0.5, m)
+			"berry":
+				Mk.sphere(holder, 0.2, m)
+			"wheel":
+				var t := Mk.torus(holder, 0.28, 0.1, m)
+				t.rotation.x = PI / 2.0
+			"panel":
+				Mk.box(holder, Vector3(0.9, 0.06, 0.55), m)
+			"blade":
+				Mk.box(holder, Vector3(1.1, 0.08, 0.18), m)
+			"dome":
+				Mk.sphere(holder, 0.38, m, Vector3.ZERO, 16, true)
+			_:
+				Mk.box(holder, Vector3(0.6, 0.45, 0.6), m)
+		Mk.cyl(g, 0.12, 0.12, 8.0, Mk.unshaded(Color("5fd3c4"), 0.3, true), Vector3(0, 4, 0), 8)
+		m_labels.append(Mk.label(g, it[0], Vector3(0, 1.7, 0), 48, Color("5fd3c4"), 0.01))
+		m_items.append({"node": g, "holder": holder, "ph": randf() * TAU})
+
+	func build_step_objects() -> void:
+		for c in m_group.get_children():
+			c.queue_free()
+		m_items.clear()
+		m_targets.clear()
+		m_labels.clear()
+		var st = cur_step()
+		if st == null:
+			return
+		var done: Array = main.save["active"]["done"]
+		match st["type"]:
+			"visit":
+				for i in st["pts"].size():
+					if done.has(i):
+						continue
+					var p: Vector2 = st["pts"][i]
+					_marker(p, st.get("r", 3.2), st["verb"])
+					m_targets.append(p)
+					var y := ground_at(p.x, p.y)
+					if st.get("crater", false):
+						var rim := Mk.torus(m_group, 2.4, 0.35, Mk.mat(Color("9a5434"), 1.0), Vector3(p.x, y + 0.05, p.y))
+						Mk.cyl(m_group, 2.2, 2.2, 0.05, Mk.mat(Color("5a2a16"), 1.0), Vector3(p.x, y + 0.03, p.y), 32)
+					if st.get("rock", false):
+						var rk := Mk.sphere(m_group, 0.8, Mk.mat(Color("b8a898"), 0.9), Vector3(p.x, y + 0.5, p.y), 7)
+						rk.scale = Vector3(1.2, 0.8, 1.0)
+			"collect":
+				for i in st["items"].size():
+					if done.has(i):
+						continue
+					_item(st["items"][i], st["ipos"][i])
+					m_targets.append(st["ipos"][i])
+			"deliver", "act":
+				var L := loc_of(st)
+				_marker(L["p"], min(float(L["r"]), 4.0), st["label"] if st["type"] == "act" else L["label"])
+				m_targets.append(L["p"])
+
+	func start_mission(id: String) -> void:
+		main.save["active"] = {"id": id, "step": 0, "done": []}
+		asm = null
+		main.persist()
+		build_step_objects()
+		main.ui.close_modal()
+		main.ui.update_tracker()
+		main.toast("%s started. %s." % [mission_by_id(id)["name"], step_text(cur_step())])
+
+	func abandon_mission() -> void:
+		main.save["active"] = null
+		asm = null
+		main.persist()
+		build_step_objects()
+		main.ui.update_tracker()
+
+	func advance_step() -> void:
+		var m = active_mission()
+		if m == null:
+			return
+		var a: Dictionary = main.save["active"]
+		a["step"] = int(a["step"]) + 1
+		a["done"] = []
+		main.persist()
+		if a["step"] >= m["steps"].size():
+			complete_mission(m)
+			return
+		build_step_objects()
+		main.ui.update_tracker()
+		var st = cur_step()
+		main.toast("Next: " + step_text(st))
+		if st["type"] == "assemble":
+			get_tree().create_timer(0.7).timeout.connect(open_assembly)
+
+	func complete_mission(m: Dictionary) -> void:
+		var first: bool = not main.save["completed"].has(m["id"])
+		if first:
+			main.save["completed"].append(m["id"])
+		main.save["active"] = null
+		main.persist()
+		build_step_objects()
+		main.ui.update_tracker()
+		if first:
+			main.add_gems(int(m["reward"]))
+		main.ui.show_history(m, int(m["reward"]) if first else 0)
+
+	func update_missions(dt: float) -> void:
+		var t := Time.get_ticks_msec() / 1000.0
+		for it in m_items:
+			if is_instance_valid(it["holder"]):
+				it["holder"].rotation.y += dt * 1.2
+				it["holder"].position.y = 0.7 + sin(t * 2.0 + it["ph"]) * 0.15
+		var st = cur_step()
+		if st == null or busy or dt == 0.0:
+			return
+		var P := Vector2(r_pos.x, r_pos.z) if in_rover else Vector2(p_pos.x, p_pos.z)
+		var done: Array = main.save["active"]["done"]
+		match st["type"]:
+			"visit":
+				for i in st["pts"].size():
+					if done.has(i):
+						continue
+					if st.get("need_rover", false) and not in_rover:
+						continue
+					var p: Vector2 = st["pts"][i]
+					if P.distance_to(p) < float(st.get("r", 3.2)) + (1.5 if in_rover else 0.0):
+						done.append(i)
+						main.persist()
+						Mk.burst(self, Vector3(p.x, ground_at(p.x, p.y) + 1.5, p.y), Color("5fd3c4"))
+						main.toast("%s: %d/%d done" % [st["verb"], done.size(), st["pts"].size()])
+						if done.size() >= st["pts"].size():
+							advance_step()
+						else:
+							build_step_objects()
+						return
+			"collect":
+				var r := 2.8 if in_rover else 1.7
+				for i in st["items"].size():
+					if done.has(i):
+						continue
+					var p: Vector2 = st["ipos"][i]
+					if P.distance_to(p) < r:
+						done.append(i)
+						main.persist()
+						Mk.burst(self, Vector3(p.x, ground_at(p.x, p.y) + 0.8, p.y), Color("5fd3c4"))
+						main.toast("Picked up %s (%d/%d)" % [st["items"][i][0], done.size(), st["items"].size()])
+						if done.size() >= st["items"].size():
+							advance_step()
+						else:
+							build_step_objects()
+						return
+			"deliver":
+				var L := loc_of(st)
+				if P.distance_to(L["p"]) < L["r"]:
+					advance_step()
+
+	func nearest_target_dist() -> float:
+		var P := Vector2(r_pos.x, r_pos.z) if in_rover else Vector2(p_pos.x, p_pos.z)
+		var best := INF
+		for p in m_targets:
+			best = min(best, P.distance_to(p))
+		return best
+
+	# assembly
+	func open_assembly() -> void:
+		var st = cur_step()
+		if st == null or st["type"] != "assemble":
+			return
+		if asm == null or asm["st"] != st:
+			var sh: Array = range(st["parts"].size())
+			var rng := RandomNumberGenerator.new()
+			rng.seed = st["parts"].size() * 13 + int(main.save["active"]["step"]) * 7
+			for i in range(sh.size() - 1, 0, -1):
+				var j := rng.randi() % (i + 1)
+				var tmp = sh[i]
+				sh[i] = sh[j]
+				sh[j] = tmp
+			var sorted := true
+			for i in sh.size():
+				if sh[i] != i:
+					sorted = false
+			if sorted:
+				sh.reverse()
+			asm = {"st": st, "placed": 0, "order": sh, "msg": "", "ok": true}
+		main.ui.show_assembly(asm)
+
+	func asm_pick(idx: int) -> void:
+		if asm == null:
+			return
+		var st: Dictionary = asm["st"]
+		var parts: Array = st["parts"]
+		if asm["placed"] >= parts.size():
+			return
+		if idx == asm["placed"]:
+			asm["placed"] += 1
+			asm["ok"] = true
+			if asm["placed"] >= parts.size():
+				asm["msg"] = "✓ " + parts[idx]["fact"] + " Assembly complete!"
+				main.ui.show_assembly(asm)
+				get_tree().create_timer(1.7).timeout.connect(_asm_done)
+			else:
+				asm["msg"] = "✓ " + parts[idx]["fact"]
+				main.ui.show_assembly(asm)
+		else:
+			asm["ok"] = false
+			asm["msg"] = "Not quite. " + parts[asm["placed"]]["clue"]
+			main.ui.show_assembly(asm)
+
+	func _asm_done() -> void:
+		main.ui.close_modal()
+		_finish_assembly()
+
+	func _finish_assembly() -> void:
+		var m = active_mission()
+		if m == null:
+			return
+		if not main.save["assembled"].has(m["id"]):
+			main.save["assembled"].append(m["id"])
+		asm = null
+		apply_trophies()
+		main.persist()
+		advance_step()
+
+	# trophies & animations
+	func apply_trophies() -> void:
+		var A: Array = main.save["assembled"]
+		if A.has("pathfinder") and not trophies.has("soj"):
+			var s := Node3D.new()
+			s.position = Vector3(31, ground_at(31, -11), -11)
+			s.rotation.y = -PI / 2.0
+			add_child(s)
+			Mk.box(s, Vector3(0.65, 0.2, 0.48), Mk.mat(Color("d8d2c8"), 0.5, 0.2), Vector3(0, 0.26, 0))
+			Mk.box(s, Vector3(0.62, 0.03, 0.46), Mk.mat(Color("1b2b5a"), 0.25, 0.6), Vector3(0, 0.4, 0))
+			for x in [-0.24, 0.0, 0.24]:
+				for z in [0.28, -0.28]:
+					var w := Mk.cyl(s, 0.07, 0.07, 0.06, Mk.mat(Color("2c3038")), Vector3(x, 0.07, z), 12)
+					w.rotation.x = PI / 2.0
+			s.scale = Vector3.ONE * 1.8
+			trophies["soj"] = s
+			add_label("Sojourner\nbuilt by you", Vector3(31, 2.2, -11), Color("d4a43a"), 48)
+		if A.has("ingenuity") and not trophies.has("heli"):
+			var h := Node3D.new()
+			h.position = Vector3(0, 0.16, 46)
+			add_child(h)
+			Mk.box(h, Vector3(0.26, 0.2, 0.22), Mk.mat(Color("d4a43a"), 0.35, 0.5), Vector3(0, 0.46, 0))
+			Mk.cyl(h, 0.02, 0.02, 0.55, Mk.mat(Color("9aa0a8")), Vector3(0, 0.83, 0), 6)
+			Mk.box(h, Vector3(0.42, 0.02, 0.26), Mk.mat(Color("1b2b5a"), 0.25, 0.6), Vector3(0, 1.12, 0))
+			for i in 4:
+				var a := TAU * i / 4.0 + PI / 4.0
+				var l := Mk.cyl(h, 0.012, 0.012, 0.5, Mk.mat(Color("9aa0a8")), Vector3(cos(a) * 0.2, 0.22, sin(a) * 0.2), 6)
+				l.rotation = Vector3(sin(a) * 0.5, 0, -cos(a) * 0.5)
+			var r1 := Node3D.new()
+			r1.position.y = 0.92
+			var r2 := Node3D.new()
+			r2.position.y = 1.02
+			r2.rotation.y = PI / 2.0
+			h.add_child(r1)
+			h.add_child(r2)
+			Mk.box(r1, Vector3(1.2, 0.015, 0.07), Mk.mat(Color("2c3038")))
+			Mk.box(r2, Vector3(1.2, 0.015, 0.07), Mk.mat(Color("2c3038")))
+			h.scale = Vector3.ONE * 1.6
+			trophies["heli"] = {"node": h, "r1": r1, "r2": r2}
+			add_c(0, 46, 1.1)
+		if A.has("insight") and not trophies.has("seis"):
+			var p: Vector2 = mres["insight"][1]["to_pos"]
+			var s := Node3D.new()
+			s.position = Vector3(p.x, ground_at(p.x, p.y), p.y)
+			add_child(s)
+			Mk.sphere(s, 0.6, Mk.mat(Color("e8e4de"), 0.6), Vector3.ZERO, 24, true)
+			Mk.cyl(s, 0.68, 0.72, 0.08, Mk.mat(Color("d4a43a"), 0.4, 0.4), Vector3(0, 0.04, 0), 24)
+			Mk.box(s, Vector3(0.4, 0.3, 0.3), Mk.mat(Color("8a9099"), 0.5, 0.3), Vector3(1.3, 0.15, 0.2))
+			trophies["seis"] = s
+			add_label("InSight seismometer\nlistening for marsquakes", Vector3(p.x, 2.6, p.y), Color("d4a43a"), 48)
+		if A.has("curiosity") and not trophies.has("drill"):
+			rover.add_drill()
+			trophies["drill"] = true
+
+	func start_mission_anim(st: Dictionary) -> void:
+		busy = true
+		if st.get("anim", "") == "heli":
+			apply_trophies()
+			heli_anim = {"t": 0.0}
+			main.toast("Spinning up the rotors… Ingenuity is flying!")
+		elif st.get("anim", "") == "drill":
+			apply_trophies()
+			drill_anim = {"t": 0.0, "next": 0.0}
+			main.toast("Drilling into John Klein…")
+		else:
+			busy = false
+			advance_step()
+
+	func _update_anims(dt: float) -> void:
+		if heli_anim != null and trophies.has("heli"):
+			var hh: Dictionary = trophies["heli"]
+			heli_anim["t"] += dt
+			var T: float = heli_anim["t"]
+			var y := 0.0
+			if T < 1.6:
+				y = T / 1.6 * 3.0
+			elif T < 4.6:
+				y = 3.0 + sin((T - 1.6) * 2.2) * 0.15
+			else:
+				y = max(0.0, 3.0 * (1.0 - (T - 4.6) / 1.6))
+			hh["node"].position.y = 0.16 + y
+			hh["r1"].rotation.y += dt * 45.0
+			hh["r2"].rotation.y -= dt * 45.0
+			if T > 6.4:
+				heli_anim = null
+				hh["node"].position.y = 0.16
+				busy = false
+				advance_step()
+		if drill_anim != null and rover.drill_fore:
+			drill_anim["t"] += dt
+			var T2: float = drill_anim["t"]
+			rover.drill_fore.rotation.x = -min(1.0, T2) * 0.5
+			rover.drill_bit.rotation.y += dt * 30.0
+			if T2 > drill_anim["next"] and T2 > 0.8:
+				drill_anim["next"] = T2 + 0.35
+				Mk.burst(self, rover.drill_bit.global_position, Color("c8763e"))
+			if T2 > 3.0:
+				drill_anim = null
+				rover.drill_fore.rotation.x = 0.0
+				busy = false
+				advance_step()
+
+
+# ======================================================================
+# All 2D interface: panels, HUD, Mission Control, modals, toasts
+# ======================================================================
+class UI extends CanvasLayer:
+	const TEXT := Color("f3e9df")
+	const MUTED := Color("b8a49a")
+	const RUST := Color("e2683a")
+	const TEAL := Color("5fd3c4")
+	const WARN := Color("ff6a4d")
+	const GOOD := Color("6fd08f")
+
+	var main
+	var root: Control
+	var touch := false
+
+	# orbit
+	var orbit_ui: Control
+	var fact_panel: PanelContainer
+	var fact_text: RichTextLabel
+	var fact_head: Button
+	var fact_calc: VBoxContainer
+	var kg_box: SpinBox
+	var calc_out: Label
+	var fact_open := true
+	var fact_scroll: ScrollContainer
+	var btn_inside: Button
+	var orbit_hint: Label
+	var orbit_buttons: HBoxContainer
+
+	# hud
+	var hud: Control
+	var stats_line: Label
+	var o2_bar: ProgressBar
+	var en_bar: ProgressBar
+	var o2_lbl: Label
+	var en_lbl: Label
+	var mode_lbl: Label
+	var tracker: PanelContainer
+	var tr_name: Label
+	var tr_step: Label
+	var tr_btn: Button
+	var minimap: Control
+	var joystick: Control
+	var action_btn: Button
+	var jump_btn: Button
+	var keys_hint: Label
+	var gem_total := 30
+	var prize_total := 12
+
+	# customise
+	var custom_panel: PanelContainer
+	var custom_rows := {}
+	var name_edit: LineEdit
+
+	# modal
+	var modal: Control
+	var modal_card: PanelContainer
+	var modal_title: Label
+	var modal_sub: Label
+	var modal_body: VBoxContainer
+	var modal_scroll: ScrollContainer
+	var modal_kind := ""
+	var modal_after: Callable = Callable()
+	var mc_tab := "missions"
+	var dec = null
+
+	var toast_panel: PanelContainer
+	var toast_label: Label
+	var toast_tween: Tween
+	var fade_rect: ColorRect
+
+	var joy_vector: Vector2:
+		get:
+			return joystick.value if joystick else Vector2.ZERO
+	var joy_index: int:
+		get:
+			return joystick.touch_index if joystick else -1
+
+	func _ready() -> void:
+		touch = DisplayServer.is_touchscreen_available()
+		root = Control.new()
+		root.set_anchors_preset(Control.PRESET_FULL_RECT)
+		root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		root.theme = _make_theme()
+		add_child(root)
+		fact_open = not _is_portrait()
+		_build_orbit_ui()
+		_build_hud()
+		_build_customize()
+		_build_modal()
+		_build_toast()
+		fade_rect = ColorRect.new()
+		fade_rect.color = Color(0, 0, 0, 0)
+		fade_rect.set_anchors_preset(Control.PRESET_FULL_RECT)
+		fade_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		root.add_child(fade_rect)
+		get_viewport().size_changed.connect(_layout)
+		_layout()
+
+	# ------------------------------------------------------------------ helpers
+	func _sb(bg: Color, radius := 14, margin := 12, border := Color(1, 0.8, 0.7, 0.14)) -> StyleBoxFlat:
+		var sb := StyleBoxFlat.new()
+		sb.bg_color = bg
+		sb.set_corner_radius_all(radius)
+		sb.set_content_margin_all(margin)
+		sb.border_color = border
+		sb.set_border_width_all(1)
+		return sb
+
+	func _make_theme() -> Theme:
+		var t := Theme.new()
+		t.default_font_size = 17
+		t.set_color("font_color", "Label", TEXT)
+		t.set_color("default_color", "RichTextLabel", TEXT)
+		t.set_stylebox("normal", "Button", _sb(Color(0.13, 0.1, 0.18, 0.92), 22, 10))
+		t.set_stylebox("hover", "Button", _sb(Color(0.2, 0.15, 0.25, 0.95), 22, 10))
+		t.set_stylebox("pressed", "Button", _sb(Color(0.25, 0.18, 0.3, 0.95), 22, 10))
+		t.set_stylebox("focus", "Button", _sb(Color(0, 0, 0, 0), 22, 10, TEAL))
+		t.set_stylebox("disabled", "Button", _sb(Color(0.1, 0.08, 0.12, 0.6), 22, 10))
+		t.set_color("font_color", "Button", TEXT)
+		t.set_color("font_hover_color", "Button", Color.WHITE)
+		t.set_stylebox("panel", "PanelContainer", _sb(Color(0.07, 0.05, 0.11, 0.88)))
+		t.set_stylebox("background", "ProgressBar", _sb(Color(1, 1, 1, 0.12), 6, 0, Color(0, 0, 0, 0)))
+		t.set_stylebox("fill", "ProgressBar", _sb(TEAL, 6, 0, Color(0, 0, 0, 0)))
+		t.set_stylebox("normal", "LineEdit", _sb(Color(0.13, 0.1, 0.18, 1), 10, 8))
+		return t
+
+	func _label(text: String, size := 17, color := TEXT, wrap := false) -> Label:
+		var l := Label.new()
+		l.text = text
+		l.add_theme_font_size_override("font_size", size)
+		l.add_theme_color_override("font_color", color)
+		if wrap:
+			l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			l.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		return l
+
+	func _rich(bb: String, size := 16) -> RichTextLabel:
+		var r := RichTextLabel.new()
+		r.bbcode_enabled = true
+		r.fit_content = true
+		r.scroll_active = false
+		r.text = bb
+		r.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		r.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		r.add_theme_font_size_override("normal_font_size", size)
+		r.add_theme_font_size_override("bold_font_size", size)
+		r.add_theme_font_size_override("italics_font_size", size)
+		return r
+
+	func _btn(text: String, cb: Callable, primary := false) -> Button:
+		var b := Button.new()
+		b.text = text
+		b.pressed.connect(cb)
+		b.focus_mode = Control.FOCUS_NONE
+		if primary:
+			b.add_theme_stylebox_override("normal", _sb(RUST, 22, 10, Color(0, 0, 0, 0)))
+			b.add_theme_stylebox_override("hover", _sb(RUST.lightened(0.1), 22, 10, Color(0, 0, 0, 0)))
+			b.add_theme_stylebox_override("pressed", _sb(RUST.darkened(0.15), 22, 10, Color(0, 0, 0, 0)))
+			b.add_theme_color_override("font_color", Color("1b0904"))
+			b.add_theme_color_override("font_hover_color", Color("1b0904"))
+			b.add_theme_color_override("font_pressed_color", Color("1b0904"))
+		return b
+
+	func _is_portrait() -> bool:
+		var s := root.get_viewport_rect().size
+		return s.y > s.x
+
+	# ------------------------------------------------------------------ orbit UI
+	func _build_orbit_ui() -> void:
+		orbit_ui = Control.new()
+		orbit_ui.set_anchors_preset(Control.PRESET_FULL_RECT)
+		orbit_ui.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		root.add_child(orbit_ui)
+		var title := VBoxContainer.new()
+		title.position = Vector2(18, 14)
+		title.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		orbit_ui.add_child(title)
+		title.add_child(_label("Mars Simulator", 38, Color("f6ebe2")))
+		title.add_child(_label("The red planet, 228 million km from the Sun.", 15, MUTED))
+
+		fact_panel = PanelContainer.new()
+		orbit_ui.add_child(fact_panel)
+		var v := VBoxContainer.new()
+		v.add_theme_constant_override("separation", 8)
+		fact_panel.add_child(v)
+		fact_head = _btn("Mars fact sheet  ▾", _toggle_facts)
+		fact_head.alignment = HORIZONTAL_ALIGNMENT_LEFT
+		v.add_child(fact_head)
+		var sc := ScrollContainer.new()
+		sc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+		sc.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		fact_scroll = sc
+		v.add_child(sc)
+		var inner := VBoxContainer.new()
+		inner.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		sc.add_child(inner)
+		fact_calc = VBoxContainer.new()
+		inner.add_child(fact_calc)
+		fact_calc.add_child(_label("Your weight on Mars", 18, TEAL))
+		var h := HBoxContainer.new()
+		fact_calc.add_child(h)
+		h.add_child(_label("On Earth I weigh", 16))
+		kg_box = SpinBox.new()
+		kg_box.min_value = 1
+		kg_box.max_value = 500
+		kg_box.value = 70
+		kg_box.suffix = "kg"
+		kg_box.value_changed.connect(func(_v): _update_calc())
+		h.add_child(kg_box)
+		calc_out = _label("", 15, TEXT, true)
+		fact_calc.add_child(calc_out)
+		fact_text = _rich(D.FACTS_TEXT, 15)
+		inner.add_child(fact_text)
+		_update_calc()
+
+		orbit_buttons = HBoxContainer.new()
+		orbit_buttons.add_theme_constant_override("separation", 8)
+		orbit_ui.add_child(orbit_buttons)
+		orbit_buttons.add_child(_btn("Find Gale Crater", func(): main.orbit.find_gale()))
+		btn_inside = _btn("See inside", func(): main.orbit.toggle_inside())
+		orbit_buttons.add_child(btn_inside)
+		orbit_buttons.add_child(_btn("Land at Gale", func(): main.orbit.fly_to_gale(), true))
+		orbit_hint = _label("", 14, Color("e9d8cc"))
+		orbit_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		orbit_ui.add_child(orbit_hint)
+		set_orbit_hint("")
+
+	func _update_calc() -> void:
+		var kg := kg_box.value
+		var feel := kg * 3.721 / 9.807
+		calc_out.text = "You’d feel like %.1f kg. Your mass stays %d kg, but gravity pulls with %d N instead of %d N, so you could jump about 2.6× higher." % [feel, int(kg), int(kg * 3.721), int(kg * 9.807)]
+
+	func _toggle_facts() -> void:
+		fact_open = not fact_open
+		_layout()
+
+	func set_fact_mode(cut: bool) -> void:
+		fact_text.text = D.LAYERS_TEXT if cut else D.FACTS_TEXT
+		fact_calc.visible = not cut
+		fact_head.text = ("Inside Mars" if cut else "Mars fact sheet") + ("  ▾" if fact_open else "  ▴")
+		btn_inside.text = "See surface" if cut else "See inside"
+		if cut:
+			toast("You’re looking inside Mars: crust, mantle and core")
+
+	func set_orbit_hint(t: String) -> void:
+		if t == "":
+			t = "Drag to spin · Scroll or pinch to zoom inside · Double-click the Gale pin to land"
+		orbit_hint.text = t
+
+	# ------------------------------------------------------------------ HUD
+	func _build_hud() -> void:
+		hud = Control.new()
+		hud.set_anchors_preset(Control.PRESET_FULL_RECT)
+		hud.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		root.add_child(hud)
+		var col := VBoxContainer.new()
+		col.position = Vector2(10, 10)
+		col.add_theme_constant_override("separation", 8)
+		col.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		hud.add_child(col)
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 6)
+		col.add_child(row)
+		row.add_child(_btn("Orbit", func(): main.go_orbit()))
+		row.add_child(_btn("Suit", func(): main.open_customize()))
+		row.add_child(_btn("Missions (M)", func(): open_mc(""), true))
+		var stats := PanelContainer.new()
+		stats.custom_minimum_size = Vector2(250, 0)
+		col.add_child(stats)
+		var sv := VBoxContainer.new()
+		stats.add_child(sv)
+		stats_line = _label("", 16)
+		sv.add_child(stats_line)
+		var r1 := _bar_row("O₂")
+		o2_bar = r1[0]
+		o2_lbl = r1[1]
+		sv.add_child(r1[2])
+		var r2 := _bar_row("Energy")
+		en_bar = r2[0]
+		en_lbl = r2[1]
+		en_bar.add_theme_stylebox_override("fill", _sb(Color("e8a33a"), 6, 0, Color(0, 0, 0, 0)))
+		sv.add_child(r2[2])
+		mode_lbl = _label("", 13, MUTED)
+		sv.add_child(mode_lbl)
+		tracker = PanelContainer.new()
+		tracker.add_theme_stylebox_override("panel", _sb(Color(0.05, 0.12, 0.12, 0.9), 12, 10, TEAL))
+		tracker.custom_minimum_size = Vector2(250, 0)
+		col.add_child(tracker)
+		var tv := VBoxContainer.new()
+		tracker.add_child(tv)
+		tr_name = _label("", 14, TEAL, true)
+		tv.add_child(tr_name)
+		tr_step = _label("", 15, TEXT, true)
+		tv.add_child(tr_step)
+		tr_btn = _btn("Open assembly", func(): main.base.open_assembly())
+		tv.add_child(tr_btn)
+		tracker.visible = false
+
+		minimap = Minimap.new()
+		hud.add_child(minimap)
+
+		if touch:
+			joystick = Joystick.new()
+			hud.add_child(joystick)
+		var pad := VBoxContainer.new()
+		pad.name = "Pad"
+		pad.alignment = BoxContainer.ALIGNMENT_END
+		pad.add_theme_constant_override("separation", 12)
+		hud.add_child(pad)
+		action_btn = _btn("", func(): main.base.do_action(), true)
+		action_btn.visible = false
+		action_btn.custom_minimum_size = Vector2(0, 52)
+		pad.add_child(action_btn)
+		if touch:
+			jump_btn = Button.new()
+			jump_btn.text = "Jump"
+			jump_btn.custom_minimum_size = Vector2(80, 80)
+			jump_btn.focus_mode = Control.FOCUS_NONE
+			jump_btn.button_down.connect(func(): main.base.jump_queued = true)
+			pad.add_child(jump_btn)
+		keys_hint = _label("WASD move · Space jump · Shift sprint · E interact · M missions · Drag to look", 14, Color.WHITE)
+		keys_hint.visible = not touch
+		hud.add_child(keys_hint)
+
+	func _bar_row(name: String) -> Array:
+		var h := HBoxContainer.new()
+		h.add_child(_label(name, 13, MUTED))
+		h.get_child(0).custom_minimum_size = Vector2(56, 0)
+		var b := ProgressBar.new()
+		b.show_percentage = false
+		b.custom_minimum_size = Vector2(120, 10)
+		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		b.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		b.value = 100
+		h.add_child(b)
+		var l := _label("100%", 13, MUTED)
+		l.custom_minimum_size = Vector2(44, 0)
+		h.add_child(l)
+		return [b, l, h]
+
+	func set_totals(g: int, p: int) -> void:
+		gem_total = g
+		prize_total = p
+		update_hud()
+
+	func update_hud() -> void:
+		if main == null or main.base == null:
+			return
+		stats_line.text = "Gems %d    Found %d/%d    Crates %d/%d" % [int(main.save["wallet"]), main.base.gems_got, gem_total, main.base.prizes_got, prize_total]
+		mode_lbl.text = ("Driving ARES" if main.base.in_rover else "On foot") + " · Sol %d" % int(main.save["sol"])
+
+	func update_bars(o2: float, en: float) -> void:
+		o2_bar.value = o2
+		o2_lbl.text = "%d%%" % int(o2)
+		o2_bar.add_theme_stylebox_override("fill", _sb(WARN if o2 < 25 else TEAL, 6, 0, Color(0, 0, 0, 0)))
+		en_bar.value = en
+		en_lbl.text = "%d%%" % int(en)
+
+	func set_action(label: String) -> void:
+		action_btn.visible = label != ""
+		action_btn.text = label + ("" if touch else "  (E)")
+
+	func update_tracker() -> void:
+		var b = main.base
+		var m = b.active_mission()
+		tracker.visible = m != null and main.mode == "base"
+		if m == null:
+			return
+		var a: Dictionary = main.save["active"]
+		var st = b.cur_step()
+		var d: float = b.nearest_target_dist()
+		tr_name.text = "%s · step %d/%d%s" % [m["name"], int(a["step"]) + 1, m["steps"].size(), ("   %d m" % int(d)) if d < INF else ""]
+		tr_step.text = b.step_text(st)
+		tr_btn.visible = st != null and st["type"] == "assemble"
+
+	func show_win() -> void:
+		open_modal("Gale Crater cleared", "You found every gem and prize crate.")
+		modal_body.add_child(_label("Your wallet holds %d gems." % int(main.save["wallet"]), 16, TEXT, true))
+		modal_body.add_child(_btn("Scatter new treasure", _win_respawn, true))
+
+	func _win_respawn() -> void:
+		close_modal()
+		main.base.respawn_treasure()
+
+	# ------------------------------------------------------------------ customise
+	func _build_customize() -> void:
+		custom_panel = PanelContainer.new()
+		root.add_child(custom_panel)
+		var sc := ScrollContainer.new()
+		sc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+		custom_panel.add_child(sc)
+		var v := VBoxContainer.new()
+		v.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		v.add_theme_constant_override("separation", 8)
+		sc.add_child(v)
+		v.add_child(_label("Suit up", 28))
+		v.add_child(_label("Create your astronaut before you step onto Gale Crater.", 15, MUTED, true))
+		v.add_child(_label("Name", 14, MUTED))
+		name_edit = LineEdit.new()
+		name_edit.placeholder_text = "Astronaut name"
+		name_edit.max_length = 14
+		name_edit.text_changed.connect(_on_name)
+		v.add_child(name_edit)
+		var opts := {
+			"gender": [["female", "Female"], ["male", "Male"]],
+			"helmet": Avatar.HELMETS,
+			"suit": [],
+			"skin": [[0, "Light"], [1, "Medium"], [2, "Tan"], [3, "Deep"]]}
+		for i in Avatar.SUITS.size():
+			opts["suit"].append([i, Avatar.SUITS[i]["name"]])
+		for key in ["gender", "helmet", "suit", "skin"]:
+			v.add_child(_label({"gender": "Gender", "helmet": "Helmet", "suit": "Suit", "skin": "Skin tone"}[key], 14, MUTED))
+			var flow := HFlowContainer.new()
+			flow.add_theme_constant_override("h_separation", 6)
+			flow.add_theme_constant_override("v_separation", 6)
+			v.add_child(flow)
+			var btns: Array = []
+			for o in opts[key]:
+				var b := _btn(o[1], _pick_option.bind(key, o[0]))
+				b.toggle_mode = true
+				flow.add_child(b)
+				btns.append([b, o[0]])
+			custom_rows[key] = btns
+		v.add_child(_btn("Start mission", func(): main.finish_customize(), true))
+
+	func _on_name(t: String) -> void:
+		main.save["cfg"]["name"] = t
+		main.base.avatar.build(main.save["cfg"])
+
+	func _pick_option(key: String, val) -> void:
+		main.save["cfg"][key] = val
+		main.base.avatar.build(main.save["cfg"])
+		_refresh_custom()
+
+	func _refresh_custom() -> void:
+		var cfg: Dictionary = main.save["cfg"]
+		name_edit.text = str(cfg.get("name", ""))
+		for key in custom_rows:
+			for pair in custom_rows[key]:
+				var cur = cfg.get(key)
+				var on: bool = str(cur) == str(pair[1])
+				pair[0].button_pressed = on
+				pair[0].add_theme_color_override("font_color", RUST if on else TEXT)
+
+	# ------------------------------------------------------------------ modal
+	func _build_modal() -> void:
+		modal = Control.new()
+		modal.set_anchors_preset(Control.PRESET_FULL_RECT)
+		modal.mouse_filter = Control.MOUSE_FILTER_STOP
+		modal.visible = false
+		root.add_child(modal)
+		var dim := ColorRect.new()
+		dim.color = Color(0.02, 0.01, 0.05, 0.55)
+		dim.set_anchors_preset(Control.PRESET_FULL_RECT)
+		modal.add_child(dim)
+		modal_card = PanelContainer.new()
+		modal_card.add_theme_stylebox_override("panel", _sb(Color(0.09, 0.07, 0.14, 0.97), 18, 16))
+		modal.add_child(modal_card)
+		var v := VBoxContainer.new()
+		v.add_theme_constant_override("separation", 8)
+		modal_card.add_child(v)
+		var head := HBoxContainer.new()
+		v.add_child(head)
+		modal_title = _label("", 24, TEXT, true)
+		head.add_child(modal_title)
+		head.add_child(_btn("Close", close_modal))
+		modal_sub = _label("", 14, MUTED, true)
+		v.add_child(modal_sub)
+		modal_scroll = ScrollContainer.new()
+		modal_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+		modal_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		v.add_child(modal_scroll)
+		modal_body = VBoxContainer.new()
+		modal_body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		modal_body.add_theme_constant_override("separation", 10)
+		modal_scroll.add_child(modal_body)
+
+	func modal_open() -> bool:
+		return modal.visible
+
+	func open_modal(title: String, sub: String) -> void:
+		modal_title.text = title
+		modal_sub.text = sub
+		modal_sub.visible = sub != ""
+		for c in modal_body.get_children():
+			modal_body.remove_child(c)
+			c.queue_free()
+		modal.visible = true
+		modal_scroll.scroll_vertical = 0
+		_layout()
+		_relayout_later()
+
+	func _relayout_later() -> void:
+		await get_tree().process_frame
+		_layout()
+		await get_tree().process_frame
+		_layout()
+
+	func close_modal() -> void:
+		if not modal.visible:
+			return
+		modal.visible = false
+		modal_kind = ""
+		var cb := modal_after
+		modal_after = Callable()
+		if cb.is_valid():
+			cb.call()
+
+	func _card(bg := Color(0.13, 0.1, 0.18, 1.0), border := Color(1, 0.8, 0.7, 0.14)) -> Array:
+		var p := PanelContainer.new()
+		p.add_theme_stylebox_override("panel", _sb(bg, 14, 12, border))
+		p.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		var v := VBoxContainer.new()
+		v.add_theme_constant_override("separation", 6)
+		p.add_child(v)
+		modal_body.add_child(p)
+		return [p, v]
+
+	func _diff_color(diff: String) -> String:
+		return {"Easy": "#6fd08f", "Medium": "#f2b84e", "Hard": "#ff6a4d"}.get(diff, "#ffffff")
+
+	# Mission Control ---------------------------------------------------
+	func open_mc(tab: String) -> void:
+		if tab != "":
+			mc_tab = tab
+		open_modal("NASA Mission Control", "Base Ares-1, Gale Crater · Wallet: %d gems" % int(main.save["wallet"]))
+		modal_kind = "mc"
+		var tabs := HBoxContainer.new()
+		tabs.add_theme_constant_override("separation", 6)
+		modal_body.add_child(tabs)
+		for t in [["missions", "Missions"], ["daily", "Daily log"], ["decisions", "Decisions"]]:
+			var b := _btn(t[1], _switch_tab.bind(t[0]), mc_tab == t[0])
+			b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			tabs.add_child(b)
+		match mc_tab:
+			"missions":
+				_mc_missions()
+			"daily":
+				_mc_daily()
+			_:
+				_mc_decisions()
+
+	func _switch_tab(t: String) -> void:
+		mc_tab = t
+		open_mc(t)
+
+	func _mc_missions() -> void:
+		var b = main.base
+		modal_body.add_child(_label("Recreate real NASA Mars missions. Harder missions earn more gems, and each one ends with a history card. %d/%d completed." % [main.save["completed"].size(), D.MISSIONS.size()], 15, MUTED, true))
+		for m in D.MISSIONS:
+			var act: bool = main.save["active"] != null and main.save["active"]["id"] == m["id"]
+			var done: bool = main.save["completed"].has(m["id"])
+			var c := _card(Color(0.06, 0.14, 0.14, 1) if act else Color(0.13, 0.1, 0.18, 1), TEAL if act else Color(1, 0.8, 0.7, 0.14))
+			var v: VBoxContainer = c[1]
+			v.add_child(_rich("[b][font_size=19]%s[/font_size][/b]  [color=#b8a49a]%s[/color]" % [m["name"], m["years"]]))
+			v.add_child(_rich("[color=%s][b]%s[/b][/color]   [color=#e2683a][b]+%d gems[/b][/color]   [color=#b8a49a]%s[/color]%s" % [_diff_color(m["diff"]), m["diff"], m["reward"], m["kind"], "   [color=#6fd08f]Completed[/color]" if done else ""], 15))
+			v.add_child(_label(m["brief"], 15, TEXT, true))
+			var row := HFlowContainer.new()
+			row.add_theme_constant_override("h_separation", 8)
+			v.add_child(row)
+			if act:
+				row.add_child(_label("In progress: " + b.step_text(b.cur_step()), 14, TEAL, true))
+				row.add_child(_btn("Abandon", _abandon))
+			else:
+				var txt := "Play again" if done else ("Switch to this mission" if main.save["active"] != null else "Start mission")
+				row.add_child(_btn(txt, b.start_mission.bind(m["id"]), not done))
+				if done:
+					row.add_child(_btn("History card", show_history.bind(m, 0)))
+
+	func _abandon() -> void:
+		main.base.abandon_mission()
+		open_mc("missions")
+
+	func _check_row(ok: bool, text: String, prog: String, reward: int, why := "") -> void:
+		var h := HBoxContainer.new()
+		h.add_theme_constant_override("separation", 10)
+		modal_body.add_child(h)
+		h.add_child(_label("Done" if ok else "To do", 13, GOOD if ok else MUTED))
+		h.get_child(0).custom_minimum_size = Vector2(48, 0)
+		var v := VBoxContainer.new()
+		v.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		h.add_child(v)
+		v.add_child(_label(text, 16, TEXT, true))
+		if why != "":
+			v.add_child(_label(why, 13, MUTED, true))
+		h.add_child(_label(("%s · " % prog if prog != "" else "") + "+%d" % reward, 14, RUST))
+
+	func _mc_daily() -> void:
+		var d: Dictionary = main.save["daily"]
+		modal_body.add_child(_label("Sol %d. Look after your body: Mars missions depend on rested, well-fed astronauts. Sleeping in your bed ends the sol. Energy: %d%%" % [int(main.save["sol"]), int(main.base.energy)], 15, MUTED, true))
+		modal_body.add_child(_label("Daily routine", 18, TEAL))
+		_check_row(int(d["meals"]) >= 2, "Eat 2 meals at the food supply", "%d/2" % mini(int(d["meals"]), 2), D.DAILY_REWARD["meals"])
+		_check_row(d["rested"], "Rest on the living-room sofa", "", D.DAILY_REWARD["rest"])
+		_check_row(false, "Sleep in your bed to finish the sol", "", D.DAILY_REWARD["sleep"])
+		modal_body.add_child(_label("Today’s challenges", 18, TEAL))
+		for c in d["ch"]:
+			var C: Dictionary = D.CHALLENGES[c["id"]]
+			_check_row(c["done"], C["text"], "%d/%d%s" % [int(c["prog"]), int(C["target"]), C.get("unit", "")], C["reward"], C.get("why", ""))
+		_check_row(false, "Perfect sol bonus: do everything, then sleep", "", D.DAILY_REWARD["bonus"])
+
+	func _mc_decisions() -> void:
+		modal_body.add_child(_label("Every choice has a gain and a loss, and each path leads to a different outcome. If you don’t like where a path leads, retry it before you accept.", 15, MUTED, true))
+		for s in D.SCENARIOS:
+			var done = main.save["decisions"].get(s["id"])
+			var c := _card()
+			var v: VBoxContainer = c[1]
+			v.add_child(_rich("[b][font_size=19]%s[/font_size][/b]" % s["title"]))
+			v.add_child(_label(("Outcome: %s" % done) if done else "Not played yet · up to +35 gems", 14, GOOD if done else MUTED))
+			v.add_child(_label(s["blurb"], 15, TEXT, true))
+			v.add_child(_btn("Replay for practice" if done else "Play scenario", open_decision.bind(s["id"], false), done == null))
+
+	# Assembly ----------------------------------------------------------
+	func show_assembly(asm: Dictionary) -> void:
+		var st: Dictionary = asm["st"]
+		var parts: Array = st["parts"]
+		open_modal(st["title"], st["text"])
+		modal_kind = "asm"
+		var grid := GridContainer.new()
+		grid.columns = 2
+		grid.add_theme_constant_override("h_separation", 8)
+		grid.add_theme_constant_override("v_separation", 8)
+		modal_body.add_child(grid)
+		for i in parts.size():
+			var filled: bool = i < asm["placed"]
+			var nxt: bool = i == asm["placed"]
+			var p := PanelContainer.new()
+			p.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			p.add_theme_stylebox_override("panel", _sb(Color(0.16, 0.1, 0.1, 1) if filled else Color(0.1, 0.08, 0.13, 1), 12, 10, RUST if filled else (TEAL if nxt else Color(1, 1, 1, 0.15))))
+			var lv := VBoxContainer.new()
+			p.add_child(lv)
+			lv.add_child(_label("Step %d" % (i + 1), 13, MUTED))
+			lv.add_child(_label(parts[i]["name"] if filled else ("Next part" if nxt else "Empty"), 15, TEXT if filled else MUTED, true))
+			grid.add_child(p)
+		var flow := HFlowContainer.new()
+		flow.add_theme_constant_override("h_separation", 8)
+		flow.add_theme_constant_override("v_separation", 8)
+		modal_body.add_child(flow)
+		for idx in asm["order"]:
+			if idx >= asm["placed"]:
+				flow.add_child(_btn(parts[idx]["name"], main.base.asm_pick.bind(idx)))
+		if asm["msg"] != "":
+			var c := _card(Color(0.08, 0.2, 0.12, 1) if asm["ok"] else Color(0.25, 0.08, 0.06, 1))
+			c[1].add_child(_label(asm["msg"], 15, TEXT, true))
+
+	# History card ------------------------------------------------------
+	func show_history(m: Dictionary, earned: int) -> void:
+		var h: Dictionary = m["history"]
+		open_modal(m["name"], h["sub"])
+		modal_kind = "hist"
+		modal_body.add_child(_rich("[color=%s][b]%s[/b][/color]   [color=#b8a49a]%s[/color]%s" % [_diff_color(m["diff"]), m["diff"], m["years"], ("   [color=#e2683a][b]+%d gems earned[/b][/color]" % earned) if earned > 0 else ""], 16))
+		var bb := "[font_size=19][color=#5fd3c4][b]Key dates[/b][/color][/font_size]\n"
+		for d in h["dates"]:
+			bb += "[b][color=#5fd3c4]%s[/color][/b]\n%s\n\n" % [d[0], d[1]]
+		bb += "[font_size=19][color=#5fd3c4][b]Facts[/b][/color][/font_size]\n"
+		for f in h["facts"]:
+			bb += "•  %s\n" % f
+		modal_body.add_child(_rich(bb, 16))
+		modal_body.add_child(_btn("Back to Mars", close_modal, true))
+
+	# Daily summary -----------------------------------------------------
+	func show_sol_summary(prev: Dictionary, bonus: bool) -> void:
+		open_modal("Sol %d complete" % int(prev["sol"]), "Here’s how your day on Mars went.")
+		_check_row(int(prev["meals"]) >= 2, "Eat 2 meals", "", D.DAILY_REWARD["meals"])
+		_check_row(prev["rested"], "Rest on the sofa", "", D.DAILY_REWARD["rest"])
+		_check_row(true, "Sleep in your bed", "", D.DAILY_REWARD["sleep"])
+		for c in prev["ch"]:
+			_check_row(c["done"], D.CHALLENGES[c["id"]]["text"], "", D.CHALLENGES[c["id"]]["reward"])
+		_check_row(bonus, "Perfect sol bonus", "", D.DAILY_REWARD["bonus"])
+		modal_body.add_child(_label("Gems earned on Sol %d: %d. Oxygen and energy are back to 100%%." % [int(prev["sol"]), int(prev["earned"])], 15, TEXT, true))
+		modal_body.add_child(_btn("Start Sol %d" % int(main.save["sol"]), close_modal, true))
+		modal_after = _after_sol
+
+	func _after_sol() -> void:
+		for s in D.SCENARIOS:
+			if not main.save["decisions"].has(s["id"]):
+				get_tree().create_timer(0.4).timeout.connect(open_decision.bind(s["id"], true))
+				return
+
+	# Decisions ---------------------------------------------------------
+	func open_decision(id: String, incoming: bool) -> void:
+		var sc = null
+		for s in D.SCENARIOS:
+			if s["id"] == id:
+				sc = s
+		dec = {"sc": sc, "path": ["start"], "choices": [], "incoming": incoming}
+		_render_dec()
+
+	func _fx_text(fx: Dictionary) -> String:
+		var out: Array = []
+		if fx.has("gems"):
+			out.append("[color=%s]%s%d gems[/color]" % ["#6fd08f" if fx["gems"] > 0 else "#ff6a4d", "+" if fx["gems"] > 0 else "−", absi(int(fx["gems"]))])
+		if fx.has("o2"):
+			out.append("[color=%s]%s%d%% O₂[/color]" % ["#6fd08f" if fx["o2"] > 0 else "#ff6a4d", "+" if fx["o2"] > 0 else "−", absi(int(fx["o2"]))])
+		if fx.has("energy"):
+			out.append("[color=%s]%s%d energy[/color]" % ["#6fd08f" if fx["energy"] > 0 else "#ff6a4d", "+" if fx["energy"] > 0 else "−", absi(int(fx["energy"]))])
+		return "   ".join(out) if out.size() > 0 else "No change"
+
+	func _render_dec() -> void:
+		var sc: Dictionary = dec["sc"]
+		var node: Dictionary = sc["nodes"][dec["path"][-1]]
+		var done = main.save["decisions"].get(sc["id"])
+		open_modal(sc["title"], "Situation report from Mission Control" if dec["incoming"] else "Decision scenario")
+		modal_kind = "dec"
+		if not node.get("end", false):
+			modal_body.add_child(_label("Decision %d of 2" % dec["path"].size(), 13, MUTED))
+			modal_body.add_child(_label(node["text"], 17, TEXT, true))
+			for i in node["options"].size():
+				var o: Dictionary = node["options"][i]
+				var c := _card()
+				var p: PanelContainer = c[0]
+				p.mouse_filter = Control.MOUSE_FILTER_STOP
+				p.gui_input.connect(_opt_input.bind(i))
+				c[1].add_child(_rich("[b][font_size=18]%s[/font_size][/b]\n[color=#5fd3c4]+ %s[/color]\n[color=#ff6a4d]− %s[/color]" % [o["label"], o["gain"], o["loss"]], 16))
+				c[1].add_child(_btn("Choose this", _choose.bind(i)))
+			if dec["path"].size() > 1:
+				modal_body.add_child(_btn("Go back to the previous choice", _dec_retry))
+		else:
+			modal_body.add_child(_rich("[font_size=22][b]%s[/b][/font_size]" % node["title"]))
+			modal_body.add_child(_label(node["text"], 17, TEXT, true))
+			modal_body.add_child(_rich(_fx_text(node["fx"]), 16))
+			modal_body.add_child(_label("Your path: " + " → ".join(dec["choices"]), 14, MUTED, true))
+			modal_body.add_child(_btn("Finish practice run" if done else "Accept this outcome", _dec_accept, true))
+			modal_body.add_child(_btn("Retry the last choice", _dec_retry))
+			modal_body.add_child(_btn("Start the scenario over", _dec_restart))
+			modal_body.add_child(_label(("Practice run: you already accepted “%s”, so this outcome won’t change your gems." % done) if done else "Not happy with this result? Retry the path before you accept.", 13, MUTED, true))
+
+	func _opt_input(ev: InputEvent, i: int) -> void:
+		if ev is InputEventMouseButton and ev.pressed and ev.button_index == MOUSE_BUTTON_LEFT:
+			_choose(i)
+
+	func _choose(i: int) -> void:
+		var node: Dictionary = dec["sc"]["nodes"][dec["path"][-1]]
+		var o: Dictionary = node["options"][i]
+		dec["path"].append(o["next"])
+		dec["choices"].append(o["label"])
+		_render_dec()
+
+	func _dec_retry() -> void:
+		if dec["path"].size() > 1:
+			dec["path"].pop_back()
+			dec["choices"].pop_back()
+		_render_dec()
+
+	func _dec_restart() -> void:
+		dec["path"] = ["start"]
+		dec["choices"] = []
+		_render_dec()
+
+	func _dec_accept() -> void:
+		var sc: Dictionary = dec["sc"]
+		var node: Dictionary = sc["nodes"][dec["path"][-1]]
+		if not main.save["decisions"].has(sc["id"]):
+			main.save["decisions"][sc["id"]] = node["title"]
+			main.base.apply_fx(node["fx"])
+			main.persist()
+			toast("Outcome: " + node["title"])
+		close_modal()
+
+	# ------------------------------------------------------------------ toast & fade
+	func _build_toast() -> void:
+		toast_panel = PanelContainer.new()
+		toast_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		toast_panel.modulate.a = 0.0
+		root.add_child(toast_panel)
+		toast_label = _label("", 16, TEXT, true)
+		toast_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		toast_panel.add_child(toast_label)
+
+	func toast(msg: String) -> void:
+		toast_label.text = msg
+		_layout()
+		_relayout_later()
+		if toast_tween:
+			toast_tween.kill()
+		toast_tween = create_tween()
+		toast_tween.tween_property(toast_panel, "modulate:a", 1.0, 0.2)
+		toast_tween.tween_interval(2.6)
+		toast_tween.tween_property(toast_panel, "modulate:a", 0.0, 0.4)
+
+	func fade(cb: Callable) -> void:
+		fade_rect.mouse_filter = Control.MOUSE_FILTER_STOP
+		var tw := create_tween()
+		tw.tween_property(fade_rect, "color:a", 1.0, 0.45)
+		tw.tween_callback(cb)
+		tw.tween_property(fade_rect, "color:a", 0.0, 0.45)
+		tw.tween_callback(func(): fade_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE)
+
+	# ------------------------------------------------------------------ mode & layout
+	func show_mode(mode: String) -> void:
+		orbit_ui.visible = mode == "orbit"
+		hud.visible = mode == "base"
+		custom_panel.visible = mode == "customize"
+		if mode == "customize":
+			_refresh_custom()
+		if mode == "base":
+			update_hud()
+			update_tracker()
+		_layout()
+
+	func _layout() -> void:
+		if root == null:
+			return
+		var s := root.get_viewport_rect().size
+		var portrait := s.y > s.x
+		# orbit fact panel
+		var fh := 0.0
+		if portrait:
+			fh = s.y * 0.45 if fact_open else 64.0
+			fact_panel.position = Vector2(0, s.y - fh)
+			fact_panel.size = Vector2(s.x, fh)
+		else:
+			fh = s.y - 32.0 if fact_open else 64.0
+			fact_panel.position = Vector2(s.x - 376, 16)
+			fact_panel.size = Vector2(360, fh)
+		fact_scroll.visible = fact_open
+		fact_head.text = fact_head.text.trim_suffix("  ▾").trim_suffix("  ▴") + ("  ▾" if fact_open else "  ▴")
+		orbit_buttons.reset_size()
+		var bw := orbit_buttons.get_combined_minimum_size().x
+		var by := (s.y - fh - 64.0) if portrait else (s.y - 64.0)
+		var avail := s.x if (portrait or not fact_open) else s.x - 376.0
+		orbit_buttons.position = Vector2(maxf(8.0, (avail - bw) / 2.0), by)
+		orbit_buttons.visible = not (portrait and fact_open)
+		orbit_hint.position = Vector2(0, by - 30)
+		orbit_hint.size = Vector2(avail, 24)
+		# hud
+		minimap.size = Vector2(150, 150)
+		minimap.position = Vector2(s.x - 160, 10)
+		if joystick:
+			joystick.size = Vector2(140, 140)
+			joystick.position = Vector2(24, s.y - 170)
+		var pad: Control = hud.get_node("Pad")
+		pad.reset_size()
+		var ps := pad.get_combined_minimum_size()
+		pad.size = ps
+		pad.position = Vector2(s.x - ps.x - 22, s.y - ps.y - 26)
+		keys_hint.reset_size()
+		keys_hint.position = Vector2((s.x - keys_hint.get_combined_minimum_size().x) / 2.0, s.y - 34)
+		# customise
+		if portrait:
+			custom_panel.position = Vector2(0, s.y * 0.48)
+			custom_panel.size = Vector2(s.x, s.y * 0.52)
+		else:
+			custom_panel.position = Vector2(18, 18)
+			custom_panel.size = Vector2(380, s.y - 36)
+		# modal
+		if portrait:
+			modal_card.position = Vector2(0, s.y * 0.12)
+			modal_card.size = Vector2(s.x, s.y * 0.88)
+		else:
+			var w := minf(640.0, s.x - 40.0)
+			modal_card.position = Vector2((s.x - w) / 2.0, 24)
+			modal_card.size = Vector2(w, s.y - 48)
+		# toast
+		var tw := minf(460.0, s.x - 30.0)
+		toast_panel.size = Vector2(tw, 0)
+		toast_panel.reset_size()
+		toast_panel.size.x = tw
+		toast_panel.position = Vector2((s.x - tw) / 2.0, s.y - 260 if portrait else s.y - 190)
